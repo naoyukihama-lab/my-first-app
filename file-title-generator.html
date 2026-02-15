@@ -470,10 +470,19 @@
   <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.4.120/pdf.min.js"></script>
 
   <script>
-    // PDF.js ワーカー設定
+    // PDF.js ワーカー設定（file://プロトコルでのCORS対策としてblobで読み込む）
+    let pdfWorkerReady = null;
     if (typeof pdfjsLib !== 'undefined') {
-      pdfjsLib.GlobalWorkerOptions.workerSrc =
-        'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.4.120/pdf.worker.min.js';
+      const PDFJS_WORKER = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.4.120/pdf.worker.min.js';
+      pdfWorkerReady = (async () => {
+        try {
+          const res = await fetch(PDFJS_WORKER);
+          const blob = await res.blob();
+          pdfjsLib.GlobalWorkerOptions.workerSrc = URL.createObjectURL(blob);
+        } catch {
+          pdfjsLib.GlobalWorkerOptions.workerSrc = PDFJS_WORKER;
+        }
+      })();
     }
     // ファイル種別定義
     const FILE_TYPES = {
@@ -704,28 +713,38 @@
     // PDF からタイトルを抽出
     async function extractTitleFromPDF(file) {
       if (typeof pdfjsLib === 'undefined') return null;
-      const arrayBuffer = await file.arrayBuffer();
-      const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
-
-      // メタデータの Title フィールドを優先
+      if (pdfWorkerReady) await pdfWorkerReady;
       try {
-        const meta = await pdf.getMetadata();
-        const t = meta.info && meta.info.Title && meta.info.Title.trim();
-        if (t && t.length >= 2) return t.substring(0, 80);
-      } catch {}
+        const arrayBuffer = await file.arrayBuffer();
+        const pdf = await pdfjsLib.getDocument({ data: new Uint8Array(arrayBuffer) }).promise;
 
-      // 1ページ目のテキストから先頭の意味ある行を取得
-      try {
+        // メタデータの Title フィールドを優先
+        try {
+          const meta = await pdf.getMetadata();
+          const t = meta.info && meta.info.Title && meta.info.Title.trim();
+          if (t && t.length >= 2) return t.substring(0, 80);
+        } catch {}
+
+        // 1ページ目のテキストをY座標でグルーピングして行を構成
+        // （PDF座標系は下が原点のため、Y値が大きいほどページ上部）
         const page = await pdf.getPage(1);
         const textContent = await page.getTextContent();
-        let buf = '';
+        const lineMap = new Map();
         for (const item of textContent.items) {
-          buf += item.str;
-          const line = buf.trim();
-          if (line.length >= 4 && line.length <= 120) return line.substring(0, 80);
+          if (!item.str) continue;
+          const y = item.transform ? Math.round(item.transform[5]) : 0;
+          lineMap.set(y, (lineMap.get(y) || '') + item.str);
         }
-      } catch {}
-
+        const lines = [...lineMap.entries()]
+          .sort((a, b) => b[0] - a[0])
+          .map(([, text]) => text.trim())
+          .filter(text => text.length >= 2);
+        for (const line of lines) {
+          if (line.length >= 4) return line.substring(0, 80);
+        }
+      } catch (e) {
+        console.warn('PDF読み込みエラー:', e);
+      }
       return null;
     }
 
