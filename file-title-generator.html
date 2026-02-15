@@ -464,7 +464,17 @@
 
   <div class="toast" id="toast">コピーしました！</div>
 
+  <!-- JSZip: DOCX/XLSX/PPTX の ZIP 解析 -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+  <!-- PDF.js: PDF テキスト抽出 -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.4.120/pdf.min.js"></script>
+
   <script>
+    // PDF.js ワーカー設定
+    if (typeof pdfjsLib !== 'undefined') {
+      pdfjsLib.GlobalWorkerOptions.workerSrc =
+        'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.4.120/pdf.worker.min.js';
+    }
     // ファイル種別定義
     const FILE_TYPES = {
       // テキスト系
@@ -534,13 +544,13 @@
       mkv:      { icon: '🎬', label: '動画',         reader: 'none' },
       webm:     { icon: '🎬', label: '動画',         reader: 'none' },
       // ドキュメント
-      pdf:      { icon: '📕', label: 'PDF',          reader: 'none' },
+      pdf:      { icon: '📕', label: 'PDF',          reader: 'pdf' },
       doc:      { icon: '📘', label: 'Word',         reader: 'none' },
-      docx:     { icon: '📘', label: 'Word',         reader: 'none' },
+      docx:     { icon: '📘', label: 'Word',         reader: 'office' },
       xls:      { icon: '📗', label: 'Excel',        reader: 'none' },
-      xlsx:     { icon: '📗', label: 'Excel',        reader: 'none' },
+      xlsx:     { icon: '📗', label: 'Excel',        reader: 'office' },
       ppt:      { icon: '📙', label: 'PowerPoint',   reader: 'none' },
-      pptx:     { icon: '📙', label: 'PowerPoint',   reader: 'none' },
+      pptx:     { icon: '📙', label: 'PowerPoint',   reader: 'office' },
       // 圧縮
       zip:      { icon: '📦', label: 'ZIP',          reader: 'none' },
       tar:      { icon: '📦', label: 'TAR',          reader: 'none' },
@@ -691,6 +701,86 @@
       });
     }
 
+    // PDF からタイトルを抽出
+    async function extractTitleFromPDF(file) {
+      if (typeof pdfjsLib === 'undefined') return null;
+      const arrayBuffer = await file.arrayBuffer();
+      const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+
+      // メタデータの Title フィールドを優先
+      try {
+        const meta = await pdf.getMetadata();
+        const t = meta.info && meta.info.Title && meta.info.Title.trim();
+        if (t && t.length >= 2) return t.substring(0, 80);
+      } catch {}
+
+      // 1ページ目のテキストから先頭の意味ある行を取得
+      try {
+        const page = await pdf.getPage(1);
+        const textContent = await page.getTextContent();
+        let buf = '';
+        for (const item of textContent.items) {
+          buf += item.str;
+          const line = buf.trim();
+          if (line.length >= 4 && line.length <= 120) return line.substring(0, 80);
+        }
+      } catch {}
+
+      return null;
+    }
+
+    // DOCX / XLSX / PPTX（Office Open XML）からタイトルを抽出
+    async function extractTitleFromOffice(file) {
+      if (typeof JSZip === 'undefined') return null;
+      const arrayBuffer = await file.arrayBuffer();
+      const zip = await JSZip.loadAsync(arrayBuffer);
+      const ext = file.name.split('.').pop().toLowerCase();
+
+      // docProps/core.xml の <dc:title> を最優先
+      const coreFile = zip.file('docProps/core.xml');
+      if (coreFile) {
+        const xml = await coreFile.async('text');
+        const m = xml.match(/<dc:title>([^<]+)<\/dc:title>/i);
+        if (m && m[1].trim()) return m[1].trim().substring(0, 80);
+      }
+
+      // DOCX: word/document.xml の最初の段落テキスト
+      if (ext === 'docx') {
+        const docFile = zip.file('word/document.xml');
+        if (docFile) {
+          const xml = await docFile.async('text');
+          const paras = xml.match(/<w:p[ >][\s\S]*?<\/w:p>/g) || [];
+          for (const para of paras) {
+            const parts = para.match(/<w:t[^>]*>([^<]+)<\/w:t>/g) || [];
+            const text = parts.map(t => t.replace(/<[^>]+>/g, '')).join('').trim();
+            if (text.length >= 4) return text.substring(0, 80);
+          }
+        }
+      }
+
+      // XLSX: xl/workbook.xml の最初のシート名
+      if (ext === 'xlsx') {
+        const wbFile = zip.file('xl/workbook.xml');
+        if (wbFile) {
+          const xml = await wbFile.async('text');
+          const m = xml.match(/<sheet[^>]+name="([^"]+)"/i);
+          if (m && m[1].trim()) return m[1].trim();
+        }
+      }
+
+      // PPTX: ppt/slides/slide1.xml の最初のテキスト
+      if (ext === 'pptx') {
+        const slide1 = zip.file('ppt/slides/slide1.xml');
+        if (slide1) {
+          const xml = await slide1.async('text');
+          const m = xml.match(/<a:t>([^<]+)<\/a:t>/);
+          if (m && m[1].trim().length >= 2) return m[1].trim().substring(0, 80);
+        }
+      }
+
+      return null;
+    }
+
     // タイトル生成メイン
     async function generateTitle(file) {
       const nameParts = file.name.split('.');
@@ -705,6 +795,22 @@
         try {
           const content = await readFileAsText(file);
           const extracted = extractTitleFromContent(content, ext);
+          if (extracted && extracted.trim().length > 0) {
+            title = extracted;
+            source = 'content';
+          }
+        } catch {}
+      } else if (fileType.reader === 'pdf' && file.size < 20 * 1024 * 1024) {
+        try {
+          const extracted = await extractTitleFromPDF(file);
+          if (extracted && extracted.trim().length > 0) {
+            title = extracted;
+            source = 'content';
+          }
+        } catch {}
+      } else if (fileType.reader === 'office' && file.size < 20 * 1024 * 1024) {
+        try {
+          const extracted = await extractTitleFromOffice(file);
           if (extracted && extracted.trim().length > 0) {
             title = extracted;
             source = 'content';
