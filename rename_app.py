@@ -9,17 +9,28 @@ rename_app.py - GUI版ファイル自動リネームアプリ（Tkinter）
   - Python 3.10 以上（tkinter は標準添付）
   - rename_files.py と同じフォルダに配置
 
-オプションライブラリ（精度向上）:
-  pip install pypdf     # PDF テキスト抽出強化
-  pip install olefile   # 旧 Office (.doc/.xls/.ppt) 抽出強化
+オプションライブラリ:
+  pip install pypdf        # PDF テキスト抽出強化
+  pip install olefile      # 旧 Office (.doc/.xls/.ppt) 抽出強化
+  pip install tkinterdnd2  # ドラッグ＆ドロップ対応
 """
 
+import re
 import threading
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 from rename_files import collect_files, generate_title, sanitize_filename
+
+# ドラッグ＆ドロップ（オプション）
+try:
+    from tkinterdnd2 import DND_FILES, TkinterDnD  # type: ignore
+    _DND_AVAILABLE = True
+except ImportError:
+    _DND_AVAILABLE = False
+
+_TkBase = TkinterDnD.Tk if _DND_AVAILABLE else tk.Tk
 
 # ---------------------------------------------------------------------------
 # 定数
@@ -47,7 +58,7 @@ COLOR_BG     = '#f6f8fa'
 # アプリ本体
 # ---------------------------------------------------------------------------
 
-class RenameApp(tk.Tk):
+class RenameApp(_TkBase):
 
     def __init__(self):
         super().__init__()
@@ -88,8 +99,9 @@ class RenameApp(tk.Tk):
         ttk.Checkbutton(top, text='サブフォルダも対象', variable=self._recursive_var,
                         command=self._on_recursive_toggle).pack(side='left', padx=(0, 8))
 
-        self._path_label = ttk.Label(top, text='フォルダまたはファイルを選択してください',
-                                     foreground='gray')
+        hint = 'ここにドロップ可 / フォルダまたはファイルを選択してください' if _DND_AVAILABLE \
+               else 'フォルダまたはファイルを選択してください'
+        self._path_label = ttk.Label(top, text=hint, foreground='gray')
         self._path_label.pack(side='left', fill='x', expand=True)
 
         # --- 中段：テーブル ---
@@ -123,6 +135,12 @@ class RenameApp(tk.Tk):
         self._tree.pack(fill='both', expand=True)
 
         self._tree.bind('<Button-1>', self._on_cell_click)
+
+        # ドラッグ＆ドロップ登録
+        if _DND_AVAILABLE:
+            for widget in (self, self._tree):
+                widget.drop_target_register(DND_FILES)
+                widget.dnd_bind('<<Drop>>', self._on_drop)
 
         # --- ボトム：操作ボタン + ステータス ---
         bottom = ttk.Frame(self, padding=(10, 6, 10, 8))
@@ -166,6 +184,22 @@ class RenameApp(tk.Tk):
     def _on_recursive_toggle(self):
         if self._selected_paths:
             self._analyze()
+
+    def _on_drop(self, event) -> None:
+        """ドラッグ＆ドロップされたファイル／フォルダを受け取る"""
+        raw: str = event.data
+        # tkinterdnd2 はスペースを含むパスを {} で囲んで返す
+        paths: list[str] = re.findall(r'\{([^}]+)\}', raw)
+        remaining = re.sub(r'\{[^}]+\}', '', raw).strip()
+        if remaining:
+            paths.extend(remaining.split())
+        paths = [p for p in paths if p]
+        if not paths:
+            return
+        self._selected_paths = paths
+        label = f'{len(paths)} 件をドロップ' if len(paths) > 1 else paths[0]
+        self._path_label.config(text=label, foreground='black')
+        self._analyze()
 
     # ------------------------------------------------------------------
     # 分析（バックグラウンドスレッド）

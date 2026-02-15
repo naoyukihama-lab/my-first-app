@@ -505,8 +505,8 @@ TEXT_EXTS = {
 }
 OFFICE_EXTS     = {'docx', 'xlsx', 'pptx'}
 OLD_OFFICE_EXTS = {'doc', 'xls', 'ppt'}
-SIZE_LIMIT_TEXT   = 5  * 1024 * 1024   # 5 MB
-SIZE_LIMIT_BINARY = 20 * 1024 * 1024   # 20 MB
+SIZE_LIMIT_TEXT   = 50  * 1024 * 1024   # 50 MB
+SIZE_LIMIT_BINARY = 200 * 1024 * 1024   # 200 MB
 
 
 def build_display_name(title: str, author: str | None, created: str | None) -> str:
