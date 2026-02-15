@@ -16,6 +16,7 @@ rename_files.py - ファイル内容からタイトルを抽出して自動リ�
 """
 
 import argparse
+import datetime
 import json
 import os
 import re
@@ -154,129 +155,190 @@ def extract_title_from_text(content: str, ext: str) -> str | None:
 # PDF からタイトル抽出
 # ---------------------------------------------------------------------------
 
-def extract_title_from_pdf(path: Path) -> str | None:
+def extract_title_from_pdf(path: Path) -> tuple[str | None, str | None, str | None]:
+    """PDF から (title, author, created) を抽出"""
+    title = author = created = None
+
     # pypdf が入っていれば優先使用
     try:
         import pypdf  # type: ignore
         reader = pypdf.PdfReader(str(path))
         meta = reader.metadata
-        if meta and getattr(meta, 'title', None) and meta.title.strip():
-            return meta.title.strip()[:80]
-        if reader.pages:
+        if meta:
+            if getattr(meta, 'title', None) and meta.title.strip():
+                title = meta.title.strip()[:80]
+            if getattr(meta, 'author', None) and meta.author.strip():
+                author = meta.author.strip()[:50]
+            raw_date = (getattr(meta, 'creation_date_raw', None)
+                        or meta.get('/CreationDate', ''))
+            if raw_date:
+                created = _parse_pdf_date(str(raw_date))
+        if not title and reader.pages:
             text = reader.pages[0].extract_text() or ''
             for line in text.split('\n'):
                 line = line.strip()
                 if len(line) >= 4:
-                    return line[:80]
+                    title = line[:80]
+                    break
     except ImportError:
         pass
     except Exception:
         pass
 
-    # フォールバック: バイナリから /Title エントリを探す
-    try:
-        with open(path, 'rb') as f:
-            raw = f.read(65536)
-        text = raw.decode('latin-1', errors='ignore')
-        m = re.search(r'/Title\s*\(([^)]{2,80})\)', text)
-        if m:
-            title = m.group(1).strip()
-            if title:
-                return title[:80]
-    except Exception:
-        pass
+    # フォールバック: バイナリから /Title /Author /CreationDate を探す
+    if not title:
+        try:
+            with open(path, 'rb') as f:
+                raw = f.read(65536)
+            text = raw.decode('latin-1', errors='ignore')
+            m = re.search(r'/Title\s*\(([^)]{2,80})\)', text)
+            if m:
+                title = m.group(1).strip()[:80] or None
+            if not author:
+                m = re.search(r'/Author\s*\(([^)]{2,50})\)', text)
+                if m:
+                    author = m.group(1).strip()[:50] or None
+            if not created:
+                m = re.search(r'/CreationDate\s*\(([^)]+)\)', text)
+                if m:
+                    created = _parse_pdf_date(m.group(1))
+        except Exception:
+            pass
 
-    return None
+    return title, author, created
 
 
 # ---------------------------------------------------------------------------
 # Office Open XML（DOCX / XLSX / PPTX）からタイトル抽出
 # ---------------------------------------------------------------------------
 
-def extract_title_from_office(path: Path, ext: str) -> str | None:
+def extract_title_from_office(path: Path, ext: str) -> tuple[str | None, str | None, str | None]:
+    """Office Open XML（DOCX/XLSX/PPTX）から (title, author, created) を抽出"""
+    title = author = created = None
     try:
         with zipfile.ZipFile(path, 'r') as z:
             names = z.namelist()
 
-            # docProps/core.xml の dc:title を最優先
+            # docProps/core.xml から title / creator / created を取得
             if 'docProps/core.xml' in names:
                 xml = z.read('docProps/core.xml').decode('utf-8', errors='ignore')
                 m = re.search(r'<dc:title>([^<]+)</dc:title>', xml, re.IGNORECASE)
                 if m and m.group(1).strip():
-                    return m.group(1).strip()[:80]
+                    title = m.group(1).strip()[:80]
+                m = re.search(r'<dc:creator>([^<]+)</dc:creator>', xml, re.IGNORECASE)
+                if m and m.group(1).strip():
+                    author = m.group(1).strip()[:50]
+                m = re.search(r'<dcterms:created[^>]*>([^<]+)</dcterms:created>', xml, re.IGNORECASE)
+                if m and m.group(1).strip():
+                    created = _parse_iso_date(m.group(1).strip())
 
-            if ext == 'docx' and 'word/document.xml' in names:
-                xml = z.read('word/document.xml').decode('utf-8', errors='ignore')
-                for para in re.findall(r'<w:p[ >].*?</w:p>', xml, re.DOTALL):
-                    parts = re.findall(r'<w:t[^>]*>([^<]+)</w:t>', para)
-                    text = ''.join(parts).strip()
-                    if len(text) >= 4:
-                        return text[:80]
-
-            if ext == 'xlsx':
-                wb = next((n for n in names if re.match(r'xl/workbook\.xml', n)), None)
-                if wb:
-                    xml = z.read(wb).decode('utf-8', errors='ignore')
-                    m = re.search(r'<sheet[^>]+name="([^"]+)"', xml, re.IGNORECASE)
-                    if m and m.group(1).strip():
-                        return m.group(1).strip()
-
-            if ext == 'pptx':
-                slides = sorted(n for n in names if re.match(r'ppt/slides/slide\d+\.xml', n))
-                if slides:
-                    xml = z.read(slides[0]).decode('utf-8', errors='ignore')
-                    m = re.search(r'<a:t>([^<]{2,})</a:t>', xml)
-                    if m and m.group(1).strip():
-                        return m.group(1).strip()[:80]
+            # タイトルが取れなかった場合はコンテンツから補完
+            if not title:
+                if ext == 'docx' and 'word/document.xml' in names:
+                    xml = z.read('word/document.xml').decode('utf-8', errors='ignore')
+                    for para in re.findall(r'<w:p[ >].*?</w:p>', xml, re.DOTALL):
+                        parts = re.findall(r'<w:t[^>]*>([^<]+)</w:t>', para)
+                        text = ''.join(parts).strip()
+                        if len(text) >= 4:
+                            title = text[:80]
+                            break
+                elif ext == 'xlsx':
+                    wb = next((n for n in names if re.match(r'xl/workbook\.xml', n)), None)
+                    if wb:
+                        xml = z.read(wb).decode('utf-8', errors='ignore')
+                        m = re.search(r'<sheet[^>]+name="([^"]+)"', xml, re.IGNORECASE)
+                        if m and m.group(1).strip():
+                            title = m.group(1).strip()
+                elif ext == 'pptx':
+                    slides = sorted(n for n in names if re.match(r'ppt/slides/slide\d+\.xml', n))
+                    if slides:
+                        xml = z.read(slides[0]).decode('utf-8', errors='ignore')
+                        m = re.search(r'<a:t>([^<]{2,})</a:t>', xml)
+                        if m and m.group(1).strip():
+                            title = m.group(1).strip()[:80]
     except Exception:
         pass
 
-    return None
+    return title, author, created
 
 
 # ---------------------------------------------------------------------------
 # 旧 Office バイナリ形式（.doc / .xls / .ppt）からタイトル抽出
 # ---------------------------------------------------------------------------
 
-def _parse_prop_set_title(data: bytes) -> str | None:
-    """Windows PROPSET（SummaryInformation）から PIDSI_TITLE (PID=2) を取得"""
+def _filetime_to_date(filetime: int) -> str | None:
+    """Windows FILETIME（100ns 単位）を 'YYYY年MM月DD日' に変換"""
+    EPOCH_DIFF = 116444736000000000  # 1601-01-01 〜 1970-01-01 の 100ns 数
+    try:
+        unix_sec = (filetime - EPOCH_DIFF) / 10_000_000
+        if unix_sec < 0 or unix_sec > 32503680000:
+            return None
+        dt = datetime.datetime(1970, 1, 1) + datetime.timedelta(seconds=unix_sec)
+        return f'{dt.year}年{dt.month:02d}月{dt.day:02d}日'
+    except Exception:
+        return None
+
+
+def _parse_iso_date(s: str) -> str | None:
+    """ISO 8601 文字列（2024-01-15T...）を 'YYYY年MM月DD日' に変換"""
+    m = re.match(r'(\d{4})-(\d{2})-(\d{2})', s)
+    return f'{m.group(1)}年{m.group(2)}月{m.group(3)}日' if m else None
+
+
+def _parse_pdf_date(s: str) -> str | None:
+    """PDF 日付文字列（D:20240115...）を 'YYYY年MM月DD日' に変換"""
+    m = re.match(r'D:(\d{4})(\d{2})(\d{2})', s)
+    return f'{m.group(1)}年{m.group(2)}月{m.group(3)}日' if m else None
+
+
+def _parse_prop_set_info(data: bytes) -> tuple[str | None, str | None, str | None]:
+    """Windows PROPSET（SummaryInformation）から (title, author, created) を取得"""
+    title = author = created = None
     try:
         if len(data) < 48:
-            return None
-        # PROPERTYSETHEADER: ByteOrder(2) Version(2) SystemID(4) CLSID(16) cSections(4)
+            return title, author, created
         c_sections = struct.unpack_from('<I', data, 24)[0]
-        if c_sections < 1 or len(data) < 48:
-            return None
-        # First section: FMTID(16) + Offset(4) at byte 28
+        if c_sections < 1:
+            return title, author, created
         section_offset = struct.unpack_from('<I', data, 44)[0]
         if section_offset + 8 > len(data):
-            return None
-        # Section: Size(4) + Count(4) + IDOFFSET pairs
+            return title, author, created
         prop_count = struct.unpack_from('<I', data, section_offset + 4)[0]
+
+        def _read_str(abs_off: int) -> str | None:
+            if abs_off + 8 > len(data):
+                return None
+            vt = struct.unpack_from('<I', data, abs_off)[0]
+            if vt == 0x1E:  # VT_LPSTR
+                n = struct.unpack_from('<I', data, abs_off + 4)[0]
+                raw = data[abs_off + 8: abs_off + 8 + n].rstrip(b'\x00')
+                return (raw.decode('cp932', errors='ignore')
+                        or raw.decode('latin-1', errors='ignore')).strip() or None
+            if vt == 0x1F:  # VT_LPWSTR
+                n = struct.unpack_from('<I', data, abs_off + 4)[0]
+                raw = data[abs_off + 8: abs_off + 8 + n * 2]
+                return raw.decode('utf-16-le', errors='ignore').rstrip('\x00').strip() or None
+            return None
+
         for i in range(min(prop_count, 200)):
             entry_off = section_offset + 8 + i * 8
             if entry_off + 8 > len(data):
                 break
             pid, prop_off = struct.unpack_from('<II', data, entry_off)
-            if pid != 2:  # PIDSI_TITLE
-                continue
             abs_off = section_offset + prop_off
-            if abs_off + 8 > len(data):
-                break
-            vt_type = struct.unpack_from('<I', data, abs_off)[0]
-            if vt_type == 0x1E:  # VT_LPSTR (ANSI)
-                strlen = struct.unpack_from('<I', data, abs_off + 4)[0]
-                raw = data[abs_off + 8: abs_off + 8 + strlen].rstrip(b'\x00')
-                title = raw.decode('cp932', errors='ignore') or raw.decode('latin-1', errors='ignore')
-                return title.strip() or None
-            elif vt_type == 0x1F:  # VT_LPWSTR (Unicode)
-                wlen = struct.unpack_from('<I', data, abs_off + 4)[0]
-                raw = data[abs_off + 8: abs_off + 8 + wlen * 2]
-                title = raw.decode('utf-16-le', errors='ignore').rstrip('\x00')
-                return title.strip() or None
+            if pid == 2:    # PIDSI_TITLE
+                title = _read_str(abs_off)
+            elif pid == 4:  # PIDSI_AUTHOR
+                author = _read_str(abs_off)
+            elif pid == 12: # PIDSI_CREATE_DTM
+                if abs_off + 12 <= len(data):
+                    vt = struct.unpack_from('<I', data, abs_off)[0]
+                    if vt == 0x40:  # VT_FILETIME
+                        ft = struct.unpack_from('<Q', data, abs_off + 4)[0]
+                        created = _filetime_to_date(ft)
     except Exception:
         pass
-    return None
+    return title, author, created
 
 
 def _extract_xls_sheet_names(data: bytes) -> list[str]:
@@ -354,80 +416,79 @@ def _scan_utf16le_strings(data: bytes, min_len: int = 6) -> list[str]:
     return results
 
 
-def extract_title_from_old_office(path: Path, ext: str) -> str | None:
-    """旧 Office 形式（.doc / .xls / .ppt）からタイトルを抽出"""
+def extract_title_from_old_office(path: Path, ext: str) -> tuple[str | None, str | None, str | None]:
+    """旧 Office 形式（.doc / .xls / .ppt）から (title, author, created) を抽出"""
+    title = author = created = None
 
     # --- 1. olefile 経由（最も正確） ---
     try:
         import olefile  # type: ignore
         with olefile.OleFileIO(str(path)) as ole:
-            # SummaryInformation の dc:title を最優先
             si = '\x05SummaryInformation'
             if ole.exists(si):
-                title = _parse_prop_set_title(ole.openstream(si).read())
-                if title:
-                    return title[:80]
+                title, author, created = _parse_prop_set_info(ole.openstream(si).read())
 
-            # ストリームからコンテンツを取得
-            if ext == 'xls':
-                for stream in ('Workbook', 'Book'):
-                    if ole.exists(stream):
-                        names = _extract_xls_sheet_names(ole.openstream(stream).read())
-                        if names:
-                            return names[0][:80]
-
-            elif ext == 'ppt':
-                if ole.exists('PowerPoint Document'):
-                    texts = _extract_ppt_texts(ole.openstream('PowerPoint Document').read())
-                    for t in texts:
-                        if len(t) >= 4:
-                            return t[:80]
-
-            elif ext == 'doc':
-                if ole.exists('WordDocument'):
-                    raw = ole.openstream('WordDocument').read()
-                    for s in _scan_utf16le_strings(raw, min_len=6):
-                        if re.match(r'^[A-Za-z\u3040-\u9FFF\u4E00-\u9FFF]', s) and len(s) >= 4:
-                            return s[:80]
+            if not title:
+                if ext == 'xls':
+                    for stream in ('Workbook', 'Book'):
+                        if ole.exists(stream):
+                            names = _extract_xls_sheet_names(ole.openstream(stream).read())
+                            if names:
+                                title = names[0][:80]
+                                break
+                elif ext == 'ppt':
+                    if ole.exists('PowerPoint Document'):
+                        texts = _extract_ppt_texts(ole.openstream('PowerPoint Document').read())
+                        for t in texts:
+                            if len(t) >= 4:
+                                title = t[:80]
+                                break
+                elif ext == 'doc':
+                    if ole.exists('WordDocument'):
+                        raw = ole.openstream('WordDocument').read()
+                        for s in _scan_utf16le_strings(raw, min_len=6):
+                            if re.match(r'^[A-Za-z\u3040-\u9FFF\u4E00-\u9FFF]', s) and len(s) >= 4:
+                                title = s[:80]
+                                break
     except ImportError:
         pass
     except Exception:
         pass
+
+    if title:
+        return title, author, created
 
     # --- 2. バイナリスキャン（olefile なし・フォールバック） ---
     try:
         with open(path, 'rb') as f:
             data = f.read()
 
-        # SummaryInformation はファイル内に固定マジックで識別可能
         magic = b'\x05SummaryInformation'
         idx = data.find(magic)
         if idx != -1:
-            # マジックの後ろにプロパティセットが続くことが多い
             chunk = data[idx + len(magic): idx + len(magic) + 4096]
-            title = _parse_prop_set_title(chunk)
-            if title:
-                return title[:80]
+            title, author, created = _parse_prop_set_info(chunk)
 
-        if ext == 'xls':
-            names = _extract_xls_sheet_names(data)
-            if names:
-                return names[0][:80]
-
-        elif ext == 'ppt':
-            texts = _extract_ppt_texts(data)
-            for t in texts:
-                if len(t) >= 4:
-                    return t[:80]
-
-        elif ext == 'doc':
-            for s in _scan_utf16le_strings(data, min_len=6):
-                if re.match(r'^[A-Za-z\u3040-\u9FFF\u4E00-\u9FFF]', s) and len(s) >= 4:
-                    return s[:80]
+        if not title:
+            if ext == 'xls':
+                names = _extract_xls_sheet_names(data)
+                if names:
+                    title = names[0][:80]
+            elif ext == 'ppt':
+                texts = _extract_ppt_texts(data)
+                for t in texts:
+                    if len(t) >= 4:
+                        title = t[:80]
+                        break
+            elif ext == 'doc':
+                for s in _scan_utf16le_strings(data, min_len=6):
+                    if re.match(r'^[A-Za-z\u3040-\u9FFF\u4E00-\u9FFF]', s) and len(s) >= 4:
+                        title = s[:80]
+                        break
     except Exception:
         pass
 
-    return None
+    return title, author, created
 
 
 # ---------------------------------------------------------------------------
@@ -448,16 +509,28 @@ SIZE_LIMIT_TEXT   = 5  * 1024 * 1024   # 5 MB
 SIZE_LIMIT_BINARY = 20 * 1024 * 1024   # 20 MB
 
 
+def build_display_name(title: str, author: str | None, created: str | None) -> str:
+    """'文書名（作成者）作成日付' の形式でファイル名を組み立てる"""
+    name = title
+    if author:
+        name += f'（{author}）'
+    if created:
+        name += created
+    return name
+
+
 def generate_title(path: Path) -> tuple[str, str]:
     """
     ファイルのタイトルを生成する。
-    戻り値: (title, source)  source は 'content' または 'filename'
+    戻り値: (display_name, source)  source は 'content' または 'filename'
     """
     ext = path.suffix.lstrip('.').lower()
     base = path.stem
     size = path.stat().st_size
 
-    title: str | None = None
+    raw_title: str | None = None
+    author:    str | None = None
+    created:   str | None = None
     source = 'filename'
 
     if ext in TEXT_EXTS and size < SIZE_LIMIT_TEXT:
@@ -466,43 +539,43 @@ def generate_title(path: Path) -> tuple[str, str]:
                 content = f.read()
             extracted = extract_title_from_text(content, ext)
             if extracted and extracted.strip():
-                title = extracted.strip()
+                raw_title = extracted.strip()
                 source = 'content'
         except Exception:
             pass
 
     elif ext == 'pdf' and size < SIZE_LIMIT_BINARY:
         try:
-            extracted = extract_title_from_pdf(path)
-            if extracted and extracted.strip():
-                title = extracted.strip()
+            raw_title, author, created = extract_title_from_pdf(path)
+            if raw_title:
+                raw_title = raw_title.strip()
                 source = 'content'
         except Exception:
             pass
 
     elif ext in OFFICE_EXTS and size < SIZE_LIMIT_BINARY:
         try:
-            extracted = extract_title_from_office(path, ext)
-            if extracted and extracted.strip():
-                title = extracted.strip()
+            raw_title, author, created = extract_title_from_office(path, ext)
+            if raw_title:
+                raw_title = raw_title.strip()
                 source = 'content'
         except Exception:
             pass
 
     elif ext in OLD_OFFICE_EXTS and size < SIZE_LIMIT_BINARY:
         try:
-            extracted = extract_title_from_old_office(path, ext)
-            if extracted and extracted.strip():
-                title = extracted.strip()
+            raw_title, author, created = extract_title_from_old_office(path, ext)
+            if raw_title:
+                raw_title = raw_title.strip()
                 source = 'content'
         except Exception:
             pass
 
-    if not title:
-        title = clean_filename(base)
+    if not raw_title:
+        raw_title = clean_filename(base)
         source = 'filename'
 
-    return title, source
+    return build_display_name(raw_title, author, created), source
 
 
 # ---------------------------------------------------------------------------
