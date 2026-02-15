@@ -547,6 +547,385 @@ def extract_title_from_old_office(path: Path, ext: str) -> tuple[str | None, str
 
 
 # ---------------------------------------------------------------------------
+# EPUB からタイトル抽出
+# ---------------------------------------------------------------------------
+
+def extract_title_from_epub(path: Path) -> tuple[str | None, str | None, str | None]:
+    """EPUB から (title, author, created) を抽出"""
+    title = author = created = None
+    try:
+        with zipfile.ZipFile(path, 'r') as z:
+            names = z.namelist()
+            # OPF ファイルのパスを container.xml から取得
+            opf_path: str | None = None
+            if 'META-INF/container.xml' in names:
+                cxml = z.read('META-INF/container.xml').decode('utf-8', errors='ignore')
+                m = re.search(r'full-path="([^"]+\.opf)"', cxml, re.IGNORECASE)
+                if m:
+                    opf_path = m.group(1)
+            if not opf_path:
+                opf_path = next((n for n in names if n.endswith('.opf')), None)
+            if opf_path and opf_path in names:
+                xml = z.read(opf_path).decode('utf-8', errors='ignore')
+                m = re.search(r'<dc:title[^>]*>([^<]+)</dc:title>', xml, re.IGNORECASE)
+                if m and m.group(1).strip():
+                    title = m.group(1).strip()[:80]
+                m = re.search(r'<dc:creator[^>]*>([^<]+)</dc:creator>', xml, re.IGNORECASE)
+                if m and m.group(1).strip():
+                    author = m.group(1).strip()[:50]
+                m = re.search(r'<dc:date[^>]*>([^<]+)</dc:date>', xml, re.IGNORECASE)
+                if m and m.group(1).strip():
+                    created = _parse_iso_date(m.group(1).strip())
+    except Exception:
+        pass
+    return title, author, created
+
+
+# ---------------------------------------------------------------------------
+# OpenDocument Format（ODT / ODS / ODP / ODG）からタイトル抽出
+# ---------------------------------------------------------------------------
+
+def extract_title_from_odf(path: Path, ext: str) -> tuple[str | None, str | None, str | None]:
+    """OpenDocument Format から (title, author, created) を抽出"""
+    title = author = created = None
+    try:
+        with zipfile.ZipFile(path, 'r') as z:
+            names = z.namelist()
+            if 'meta.xml' in names:
+                xml = z.read('meta.xml').decode('utf-8', errors='ignore')
+                m = re.search(r'<dc:title>([^<]+)</dc:title>', xml, re.IGNORECASE)
+                if m and m.group(1).strip():
+                    title = m.group(1).strip()[:80]
+                m = re.search(r'<dc:creator>([^<]+)</dc:creator>', xml, re.IGNORECASE)
+                if m and m.group(1).strip():
+                    author = m.group(1).strip()[:50]
+                m = re.search(r'<meta:creation-date>([^<]+)</meta:creation-date>', xml, re.IGNORECASE)
+                if m and m.group(1).strip():
+                    created = _parse_iso_date(m.group(1).strip())
+            # メタデータからタイトルが取れない場合はコンテンツから補完
+            if not title and 'content.xml' in names:
+                xml = z.read('content.xml').decode('utf-8', errors='ignore')
+                if ext in ('odt', 'ott'):
+                    texts = re.findall(r'<text:p[^>]*>([^<]{4,})</text:p>', xml)
+                    if texts:
+                        title = texts[0].strip()[:80]
+                elif ext in ('ods', 'ots'):
+                    m = re.search(r'table:name="([^"]+)"', xml, re.IGNORECASE)
+                    if m and m.group(1).strip():
+                        title = m.group(1).strip()[:80]
+                elif ext in ('odp', 'otp'):
+                    texts = re.findall(r'<text:span[^>]*>([^<]{4,})</text:span>', xml)
+                    if texts:
+                        title = texts[0].strip()[:80]
+    except Exception:
+        pass
+    return title, author, created
+
+
+# ---------------------------------------------------------------------------
+# Apple iWork（Pages / Numbers / Keynote）からタイトル抽出
+# ---------------------------------------------------------------------------
+
+def extract_title_from_iwork(path: Path, ext: str) -> tuple[str | None, str | None, str | None]:
+    """Apple iWork ファイルから (title, author, created) を抽出"""
+    title = author = created = None
+    try:
+        with zipfile.ZipFile(path, 'r') as z:
+            names = z.namelist()
+            # index.xml / metadata.plist などを優先して確認
+            for candidate in ('index.xml', 'metadata.plist', 'buildVersionHistory.plist'):
+                if candidate not in names:
+                    continue
+                raw = z.read(candidate)
+                text = raw.decode('utf-8', errors='ignore')
+                m = re.search(r'<key>title</key>\s*<string>([^<]+)</string>', text, re.IGNORECASE)
+                if m and m.group(1).strip():
+                    title = m.group(1).strip()[:80]
+                    break
+            # フォールバック: sf:string 属性からテキストを取り出す
+            if not title:
+                for n in sorted(names):
+                    if not n.endswith('.xml'):
+                        continue
+                    try:
+                        xml = z.read(n).decode('utf-8', errors='ignore')
+                        hits = re.findall(r'sfa:string="([^"]{4,80})"', xml)
+                        if hits:
+                            title = hits[0].strip()[:80]
+                            break
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+    return title, author, created
+
+
+# ---------------------------------------------------------------------------
+# 画像（JPEG / PNG / TIFF など）EXIF からタイトル抽出
+# ---------------------------------------------------------------------------
+
+def extract_title_from_image(path: Path) -> tuple[str | None, str | None, str | None]:
+    """画像ファイルの EXIF メタデータから (title, author, created) を抽出"""
+    title = author = created = None
+
+    # Pillow が利用可能な場合は優先使用
+    try:
+        from PIL import Image  # type: ignore
+        from PIL.ExifTags import TAGS  # type: ignore
+        with Image.open(str(path)) as img:
+            exif_data = img._getexif() if hasattr(img, '_getexif') else None  # type: ignore[attr-defined]
+            if exif_data:
+                for tag_id, value in exif_data.items():
+                    tag = TAGS.get(tag_id, '')
+                    if tag == 'ImageDescription' and value:
+                        s = str(value).strip()
+                        if s:
+                            title = s[:80]
+                    elif tag == 'Artist' and value:
+                        s = str(value).strip()
+                        if s:
+                            author = s[:50]
+                    elif tag in ('DateTime', 'DateTimeOriginal') and value and not created:
+                        m = re.match(r'(\d{4}):(\d{2}):(\d{2})', str(value))
+                        if m:
+                            created = f'{m.group(1)}年{m.group(2)}月{m.group(3)}日'
+            # XMP から dc:title を試みる
+            if not title and hasattr(img, 'info'):
+                xmp = img.info.get('XML:com.adobe.xmp') or img.info.get('xmp') or ''
+                if xmp:
+                    mx = re.search(r'<dc:title>.*?<rdf:li[^>]*>([^<]+)</rdf:li>', xmp, re.DOTALL)
+                    if mx and mx.group(1).strip():
+                        title = mx.group(1).strip()[:80]
+        return title, author, created
+    except ImportError:
+        pass
+    except Exception:
+        pass
+
+    # フォールバック: JPEG の APP1 マーカーから EXIF IFD0 を直接パース
+    try:
+        ext_lower = path.suffix.lower().lstrip('.')
+        with open(path, 'rb') as f:
+            data = f.read(131072)
+        if ext_lower in ('jpg', 'jpeg') and data[:2] == b'\xff\xd8':
+            i = 2
+            while i < len(data) - 4:
+                if data[i] != 0xFF:
+                    break
+                marker = data[i:i+2]
+                if marker == b'\xff\xda':
+                    break
+                seg_len = struct.unpack_from('>H', data, i + 2)[0]
+                if marker == b'\xff\xe1' and data[i+4:i+10] == b'Exif\x00\x00':
+                    tiff = data[i + 10:]
+                    if tiff[:2] == b'II':
+                        bo = '<'
+                    elif tiff[:2] == b'MM':
+                        bo = '>'
+                    else:
+                        break
+                    ifd_off = struct.unpack_from(f'{bo}I', tiff, 4)[0]
+                    count = struct.unpack_from(f'{bo}H', tiff, ifd_off)[0]
+                    for j in range(min(count, 128)):
+                        eo = ifd_off + 2 + j * 12
+                        if eo + 12 > len(tiff):
+                            break
+                        tag, typ, cnt, val = struct.unpack_from(f'{bo}HHII', tiff, eo)
+                        raw_bytes = tiff[val:val + cnt] if cnt > 4 else struct.pack(f'{bo}I', val)[:cnt]
+                        s = raw_bytes.decode('utf-8', errors='replace').rstrip('\x00').strip()
+                        if tag == 0x010E and len(s) >= 2:
+                            title = s[:80]
+                        elif tag == 0x013B and s:
+                            author = s[:50]
+                        elif tag == 0x0132 and not created:
+                            mx = re.match(r'(\d{4}):(\d{2}):(\d{2})', s)
+                            if mx:
+                                created = f'{mx.group(1)}年{mx.group(2)}月{mx.group(3)}日'
+                    break
+                i += 2 + seg_len
+    except Exception:
+        pass
+
+    return title, author, created
+
+
+# ---------------------------------------------------------------------------
+# 音声・動画 メタデータからタイトル抽出
+# ---------------------------------------------------------------------------
+
+def extract_title_from_audio(path: Path) -> tuple[str | None, str | None, str | None]:
+    """音声・動画ファイルのタグから (title, author, created) を抽出"""
+    title = author = created = None
+
+    # mutagen が利用可能な場合は優先使用
+    try:
+        import mutagen  # type: ignore
+        audio = mutagen.File(str(path), easy=True)
+        if audio:
+            t = audio.get('title', [])
+            if t:
+                title = str(t[0]).strip()[:80] or None
+            a = audio.get('artist', []) or audio.get('albumartist', [])
+            if a:
+                author = str(a[0]).strip()[:50] or None
+            for key in ('date', 'year', 'originaldate'):
+                d = audio.get(key, [])
+                if d:
+                    mx = re.match(r'(\d{4})[-/.]?(\d{0,2})[-/.]?(\d{0,2})', str(d[0]))
+                    if mx:
+                        mo = mx.group(2).zfill(2) if mx.group(2) else '01'
+                        dy = mx.group(3).zfill(2) if mx.group(3) else '01'
+                        created = f'{mx.group(1)}年{mo}月{dy}日'
+                    break
+        return title, author, created
+    except ImportError:
+        pass
+    except Exception:
+        pass
+
+    # フォールバック: ID3v2 バイナリパース（MP3 専用）
+    if path.suffix.lower() == '.mp3':
+        try:
+            with open(path, 'rb') as f:
+                hdr = f.read(10)
+            if hdr[:3] != b'ID3':
+                return title, author, created
+            version = hdr[3]
+            tag_size = ((hdr[6] & 0x7f) << 21 | (hdr[7] & 0x7f) << 14 |
+                        (hdr[8] & 0x7f) << 7  | (hdr[9] & 0x7f))
+            with open(path, 'rb') as f:
+                f.read(10)
+                tag_data = f.read(min(tag_size, 1024 * 1024))
+            fid_len = 3 if version == 2 else 4
+            i = 0
+            while i < len(tag_data) - fid_len - 4:
+                fid_bytes = tag_data[i:i + fid_len]
+                if not fid_bytes or fid_bytes[0] == 0:
+                    break
+                fid_str = fid_bytes.decode('latin-1', errors='ignore')
+                if not re.match(r'^[A-Z][A-Z0-9]{2,3}$', fid_str):
+                    break
+                if version == 2:
+                    fsize = tag_data[i+3] << 16 | tag_data[i+4] << 8 | tag_data[i+5]
+                    fdata = tag_data[i+6:i+6+fsize]
+                    i += 6 + fsize
+                else:
+                    fsize = struct.unpack_from('>I', tag_data, i + 4)[0]
+                    fdata = tag_data[i+10:i+10+fsize]
+                    i += 10 + fsize
+                if not fdata:
+                    continue
+                enc = fdata[0]
+                content_bytes = fdata[1:]
+                try:
+                    if enc == 0:
+                        text = content_bytes.split(b'\x00')[0].decode('cp932', errors='replace')
+                    elif enc == 1:
+                        text = content_bytes.decode('utf-16', errors='ignore').split('\x00')[0]
+                    elif enc == 2:
+                        text = content_bytes.decode('utf-16-be', errors='ignore').split('\x00')[0]
+                    else:
+                        text = content_bytes.split(b'\x00')[0].decode('utf-8', errors='ignore')
+                    text = text.strip()
+                except Exception:
+                    text = ''
+                if fid_str in ('TIT2', 'TT2') and text:
+                    title = text[:80]
+                elif fid_str in ('TPE1', 'TP1') and text:
+                    author = text[:50]
+                elif fid_str in ('TDRC', 'TYER', 'TYE') and text and not created:
+                    mx = re.match(r'(\d{4})[-/.]?(\d{0,2})[-/.]?(\d{0,2})', text)
+                    if mx:
+                        mo = mx.group(2).zfill(2) if mx.group(2) else '01'
+                        dy = mx.group(3).zfill(2) if mx.group(3) else '01'
+                        created = f'{mx.group(1)}年{mo}月{dy}日'
+        except Exception:
+            pass
+
+    return title, author, created
+
+
+# ---------------------------------------------------------------------------
+# メール（EML）からタイトル抽出
+# ---------------------------------------------------------------------------
+
+def extract_title_from_eml(path: Path) -> tuple[str | None, str | None, str | None]:
+    """EML/MBOX ファイルから (subject, from_name, date) を抽出"""
+    title = author = created = None
+    try:
+        import email
+        import email.header
+        import email.utils
+        with open(path, 'rb') as f:
+            msg = email.message_from_binary_file(f)
+        # Subject → title
+        raw_subject = msg.get('Subject', '')
+        if raw_subject:
+            parts = email.header.decode_header(raw_subject)
+            decoded = ''
+            for part, charset in parts:
+                if isinstance(part, bytes):
+                    decoded += part.decode(charset or 'utf-8', errors='ignore')
+                else:
+                    decoded += part
+            title = decoded.strip()[:80] or None
+        # From → author (名前部分のみ)
+        from_addr = msg.get('From', '')
+        if from_addr:
+            name, _ = email.utils.parseaddr(from_addr)
+            if name:
+                author = name.strip()[:50] or None
+        # Date → created
+        date_str = msg.get('Date', '')
+        if date_str:
+            dt = email.utils.parsedate(date_str)
+            if dt:
+                created = f'{dt[0]}年{dt[1]:02d}月{dt[2]:02d}日'
+    except Exception:
+        pass
+    return title, author, created
+
+
+# ---------------------------------------------------------------------------
+# Outlook MSG からタイトル抽出
+# ---------------------------------------------------------------------------
+
+def extract_title_from_msg(path: Path) -> tuple[str | None, str | None, str | None]:
+    """Outlook MSG ファイルから (subject, sender_name, date) を抽出"""
+    title = author = created = None
+    try:
+        import olefile  # type: ignore
+        with olefile.OleFileIO(str(path)) as ole:
+            for stream_path in ole.listdir():
+                sname = stream_path[-1].upper() if stream_path else ''
+                # PR_SUBJECT (0x0037)
+                if '0037001F' in sname:
+                    raw = ole.openstream(stream_path).read()
+                    title = raw.decode('utf-16-le', errors='ignore').rstrip('\x00').strip()[:80] or None
+                elif '0037001E' in sname and not title:
+                    raw = ole.openstream(stream_path).read()
+                    title = raw.decode('cp932', errors='ignore').rstrip('\x00').strip()[:80] or None
+                # PR_SENDER_NAME (0x0C1A)
+                elif '0C1A001F' in sname:
+                    raw = ole.openstream(stream_path).read()
+                    author = raw.decode('utf-16-le', errors='ignore').rstrip('\x00').strip()[:50] or None
+                elif '0C1A001E' in sname and not author:
+                    raw = ole.openstream(stream_path).read()
+                    author = raw.decode('cp932', errors='ignore').rstrip('\x00').strip()[:50] or None
+                # PR_MESSAGE_DELIVERY_TIME (0x0E06) - FILETIME
+                elif '0E060040' in sname:
+                    raw = ole.openstream(stream_path).read()
+                    if len(raw) >= 8:
+                        ft = struct.unpack_from('<Q', raw)[0]
+                        created = _filetime_to_date(ft)
+    except ImportError:
+        pass
+    except Exception:
+        pass
+    return title, author, created
+
+
+# ---------------------------------------------------------------------------
 # タイトル生成メイン
 # ---------------------------------------------------------------------------
 
@@ -683,6 +1062,62 @@ def generate_title(path: Path) -> tuple[str, str]:
             raw_title, author, created = extract_title_from_old_office(path, ext)
             if raw_title:
                 raw_title = raw_title.strip()
+                source = 'content'
+        except Exception:
+            pass
+
+    elif ext in EPUB_EXTS and size < SIZE_LIMIT_BINARY:
+        try:
+            raw_title, author, created = extract_title_from_epub(path)
+            if raw_title:
+                source = 'content'
+        except Exception:
+            pass
+
+    elif ext in ODF_EXTS and size < SIZE_LIMIT_BINARY:
+        try:
+            raw_title, author, created = extract_title_from_odf(path, ext)
+            if raw_title:
+                source = 'content'
+        except Exception:
+            pass
+
+    elif ext in IWORK_EXTS and size < SIZE_LIMIT_BINARY:
+        try:
+            raw_title, author, created = extract_title_from_iwork(path, ext)
+            if raw_title:
+                source = 'content'
+        except Exception:
+            pass
+
+    elif ext in IMAGE_EXTS and size < SIZE_LIMIT_BINARY:
+        try:
+            raw_title, author, created = extract_title_from_image(path)
+            if raw_title:
+                source = 'content'
+        except Exception:
+            pass
+
+    elif ext in (AUDIO_EXTS | VIDEO_EXTS) and size < SIZE_LIMIT_BINARY:
+        try:
+            raw_title, author, created = extract_title_from_audio(path)
+            if raw_title:
+                source = 'content'
+        except Exception:
+            pass
+
+    elif ext in EML_EXTS and size < SIZE_LIMIT_TEXT:
+        try:
+            raw_title, author, created = extract_title_from_eml(path)
+            if raw_title:
+                source = 'content'
+        except Exception:
+            pass
+
+    elif ext in MSG_EXTS and size < SIZE_LIMIT_BINARY:
+        try:
+            raw_title, author, created = extract_title_from_msg(path)
+            if raw_title:
                 source = 'content'
         except Exception:
             pass
