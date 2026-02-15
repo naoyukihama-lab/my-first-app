@@ -210,9 +210,10 @@ def extract_title_from_text(content: str, ext: str) -> str | None:
 # PDF からタイトル抽出
 # ---------------------------------------------------------------------------
 
-def extract_title_from_pdf(path: Path) -> tuple[str | None, str | None, str | None]:
-    """PDF から (title, author, created) を抽出"""
-    title = author = created = None
+def extract_title_from_pdf(path: Path) -> tuple[str | None, str | None, str | None, str | None]:
+    """PDF から (title, author, created, recipient) を抽出。
+    recipient は /Subject メタデータフィールドに記録された宛先情報。"""
+    title = author = created = recipient = None
 
     # pypdf が入っていれば優先使用
     try:
@@ -228,6 +229,10 @@ def extract_title_from_pdf(path: Path) -> tuple[str | None, str | None, str | No
                         or meta.get('/CreationDate', ''))
             if raw_date:
                 created = _parse_pdf_date(str(raw_date))
+            # /Subject → 宛先
+            subj = meta.get('/Subject', '') or ''
+            if subj.strip():
+                recipient = subj.strip()[:50]
         if not title and reader.pages:
             text = reader.pages[0].extract_text() or ''
             for line in text.split('\n'):
@@ -240,7 +245,7 @@ def extract_title_from_pdf(path: Path) -> tuple[str | None, str | None, str | No
     except Exception:
         pass
 
-    # フォールバック: バイナリから /Title /Author /CreationDate を探す
+    # フォールバック: バイナリから /Title /Author /Subject /CreationDate を探す
     if not title:
         try:
             with open(path, 'rb') as f:
@@ -253,6 +258,10 @@ def extract_title_from_pdf(path: Path) -> tuple[str | None, str | None, str | No
                 m = re.search(r'/Author\s*\(([^)]{2,50})\)', text)
                 if m:
                     author = m.group(1).strip()[:50] or None
+            if not recipient:
+                m = re.search(r'/Subject\s*\(([^)]{2,50})\)', text)
+                if m:
+                    recipient = m.group(1).strip()[:50] or None
             if not created:
                 m = re.search(r'/CreationDate\s*\(([^)]+)\)', text)
                 if m:
@@ -260,7 +269,7 @@ def extract_title_from_pdf(path: Path) -> tuple[str | None, str | None, str | No
         except Exception:
             pass
 
-    return title, author, created
+    return title, author, created, recipient
 
 
 # ---------------------------------------------------------------------------
@@ -1026,6 +1035,7 @@ def generate_title(path: Path) -> tuple[str, str]:
     raw_title: str | None = None
     author:    str | None = None
     created:   str | None = None
+    recipient: str | None = None   # PDF の宛先（/Subject フィールド）
     source = 'filename'
 
     if ext in TEXT_EXTS and size < SIZE_LIMIT_TEXT:
@@ -1041,7 +1051,7 @@ def generate_title(path: Path) -> tuple[str, str]:
 
     elif ext == 'pdf' and size < SIZE_LIMIT_BINARY:
         try:
-            raw_title, author, created = extract_title_from_pdf(path)
+            raw_title, author, created, recipient = extract_title_from_pdf(path)
             if raw_title:
                 raw_title = raw_title.strip()
                 source = 'content'
@@ -1126,7 +1136,18 @@ def generate_title(path: Path) -> tuple[str, str]:
         raw_title = clean_filename(base)
         source = 'filename'
 
-    return build_display_name(raw_title, author, created), source
+    # PDF の場合のみ宛先を表示名に含める: 文書名（作成者→宛先）作成日付
+    if recipient and author:
+        name = raw_title + f'（{author}→{recipient}）'
+    elif recipient:
+        name = raw_title + f'（→{recipient}）'
+    else:
+        name = build_display_name(raw_title, author, created)
+        return name, source
+
+    if created:
+        name += created
+    return name, source
 
 
 # ---------------------------------------------------------------------------
