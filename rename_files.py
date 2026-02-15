@@ -115,12 +115,67 @@ def extract_title_from_text(content: str, ext: str) -> str | None:
             if m:
                 return m.group(1).strip()
 
+    # RTF: {\info{\title ...}} ブロックからタイトルを抽出
+    if ext == 'rtf':
+        m = re.search(r'\\title ([^\\}{]+)', content)
+        if not m:
+            m = re.search(r'\\subject ([^\\}{]+)', content)
+        if m:
+            return m.group(1).strip()[:80]
+
+    # LaTeX: \title{...} / \author{...}
+    if ext in ('tex', 'latex', 'sty', 'cls'):
+        m = re.search(r'\\title\{([^}]+)\}', content)
+        if m:
+            # LaTeX コマンドを除去: \textbf{foo} → foo
+            t = re.sub(r'\\[a-zA-Z]+\{([^}]*)\}', r'\1', m.group(1))
+            t = re.sub(r'\\[a-zA-Z]+', '', t).strip()
+            if t:
+                return t[:80]
+
+    # iCalendar (.ics): SUMMARY: または X-WR-CALNAME:
+    if ext in ('ics', 'vcs'):
+        for line in lines:
+            if line.startswith('SUMMARY:') or line.startswith('X-WR-CALNAME:'):
+                return line.split(':', 1)[1].strip()[:80]
+
+    # vCard (.vcf): FN: (Full Name)
+    if ext == 'vcf':
+        for line in lines:
+            if line.startswith('FN:'):
+                return line[3:].strip()[:80]
+            if line.startswith('N:'):
+                parts = [p.strip() for p in line[2:].split(';') if p.strip()]
+                name = ' '.join(parts[:2])
+                if name:
+                    return name[:80]
+
+    # 設定ファイル: [Section] または title/name キー
+    if ext in ('ini', 'cfg', 'conf', 'config', 'properties', 'env'):
+        for line in lines[:30]:
+            m = re.match(r'^\[([^\]]+)\]', line)
+            if m:
+                sec = m.group(1).strip()
+                if sec.lower() not in ('general', 'default', 'main', 'settings', 'global', 'common'):
+                    return sec[:80]
+        for line in lines[:50]:
+            m = re.match(r'^(?:title|name|app_?name|project_?name)\s*[=:]\s*["\']?(.+?)["\']?\s*$',
+                         line, re.IGNORECASE)
+            if m and m.group(1).strip():
+                return m.group(1).strip()[:80]
+
     # コードファイル: 先頭コメント → クラス名 → 関数名
     code_exts = {
-        'js', 'mjs', 'ts', 'tsx', 'jsx', 'vue', 'svelte',
-        'py', 'rb', 'php', 'java', 'kt', 'swift', 'go', 'rs',
-        'cpp', 'c', 'cs', 'sh', 'bash', 'zsh', 'ps1', 'sql', 'r', 'lua',
-        'css', 'scss', 'sass',
+        'js', 'mjs', 'cjs', 'ts', 'mts', 'tsx', 'jsx', 'vue', 'svelte',
+        'py', 'pyw', 'pyi', 'rb', 'php', 'java', 'kt', 'swift', 'go', 'rs',
+        'cpp', 'cxx', 'cc', 'c', 'h', 'hpp', 'cs', 'vb', 'fs',
+        'sh', 'bash', 'zsh', 'fish', 'ps1', 'sql', 'r', 'lua',
+        'css', 'scss', 'sass', 'less',
+        'hs', 'ex', 'exs', 'clj', 'elm', 'jl', 'nim', 'zig', 'cr', 'd',
+        'ml', 'scala', 'dart', 'pl', 'pm', 'tcl', 'awk', 'coffee',
+        'pas', 'f90', 'for', 'erl', 'groovy', 'gradle', 'tf', 'hcl',
+        'proto', 'graphql', 'gql', 'makefile', 'mk', 'dockerfile',
+        'rkt', 'lisp', 'scm',
     }
     if ext in code_exts:
         for line in lines[:20]:
@@ -496,15 +551,76 @@ def extract_title_from_old_office(path: Path, ext: str) -> tuple[str | None, str
 # ---------------------------------------------------------------------------
 
 TEXT_EXTS = {
-    'txt', 'md', 'markdown', 'rst',
-    'html', 'htm', 'css', 'scss', 'sass',
-    'json', 'xml', 'csv', 'tsv', 'yaml', 'yml', 'toml',
-    'js', 'mjs', 'ts', 'tsx', 'jsx', 'vue', 'svelte',
-    'py', 'rb', 'php', 'java', 'kt', 'swift', 'go', 'rs',
-    'cpp', 'c', 'cs', 'sh', 'bash', 'zsh', 'ps1', 'sql', 'r', 'lua', 'svg',
+    # ドキュメント・マークアップ
+    'txt', 'md', 'markdown', 'rst', 'adoc', 'asciidoc', 'textile', 'wiki',
+    'tex', 'latex', 'sty', 'cls', 'bib', 'rtf',
+    # Web
+    'html', 'htm', 'xhtml', 'css', 'scss', 'sass', 'less', 'stylus', 'styl',
+    'svg',
+    # テンプレート
+    'astro', 'svelte', 'vue', 'jsx', 'tsx',
+    'njk', 'j2', 'jinja', 'jinja2', 'hbs', 'handlebars', 'mustache',
+    'pug', 'jade', 'twig', 'blade', 'erb', 'ejs',
+    # データ・設定
+    'json', 'jsonc', 'jsonl', 'ndjson',
+    'xml', 'csv', 'tsv', 'yaml', 'yml', 'toml',
+    'ini', 'cfg', 'conf', 'config', 'properties', 'env',
+    'tf', 'hcl',                    # Terraform / HCL
+    'proto', 'graphql', 'gql',      # Protocol Buffers / GraphQL
+    'gradle', 'groovy',             # Gradle / Groovy
+    # カレンダー・連絡先
+    'ics', 'vcs', 'vcf',
+    # プログラミング言語
+    'js', 'mjs', 'cjs', 'ts', 'mts',
+    'py', 'pyw', 'pyi',
+    'rb', 'rake',
+    'php', 'php3', 'php4', 'php5', 'phtml',
+    'java', 'kt', 'kts', 'groovy',
+    'swift', 'go', 'rs',
+    'cpp', 'cxx', 'cc', 'c', 'h', 'hpp', 'hxx',
+    'cs', 'vb', 'fs', 'fsx',       # C# / VB.NET / F#
+    'sh', 'bash', 'zsh', 'fish', 'ksh', 'csh',
+    'ps1', 'psm1', 'psd1',         # PowerShell
+    'sql', 'ddl', 'dml',
+    'r', 'rmd',                    # R
+    'lua', 'm',                    # Lua / MATLAB・Objective-C
+    'mm',                          # Objective-C++
+    # 関数型・その他
+    'hs', 'lhs',                   # Haskell
+    'ex', 'exs',                   # Elixir
+    'clj', 'cljs', 'cljc',        # Clojure
+    'elm',                         # Elm
+    'jl',                          # Julia
+    'nim',                         # Nim
+    'zig',                         # Zig
+    'cr',                          # Crystal
+    'rkt',                         # Racket
+    'd',                           # D言語
+    'ml', 'mli',                   # OCaml
+    'scala', 'sc',                 # Scala
+    'dart',                        # Dart
+    'pl', 'pm',                    # Perl
+    'tcl',                         # Tcl
+    'awk',                         # AWK
+    'coffee',                      # CoffeeScript
+    'pas', 'pp',                   # Pascal
+    'f90', 'f95', 'f03', 'for', 'f',   # Fortran
+    'v', 'vhd', 'vhdl', 'sv',     # Verilog / VHDL
+    'lisp', 'scm', 'ss',          # Lisp / Scheme
+    'erl', 'hrl',                  # Erlang
+    'makefile', 'mk', 'cmake',     # ビルドスクリプト
+    'dockerfile',
 }
 OFFICE_EXTS     = {'docx', 'xlsx', 'pptx'}
 OLD_OFFICE_EXTS = {'doc', 'xls', 'ppt'}
+EPUB_EXTS       = {'epub'}
+ODF_EXTS        = {'odt', 'ods', 'odp', 'odg', 'ott', 'ots', 'otp'}
+IWORK_EXTS      = {'pages', 'numbers', 'keynote'}
+IMAGE_EXTS      = {'jpg', 'jpeg', 'png', 'tiff', 'tif', 'webp', 'heic', 'heif', 'bmp', 'gif'}
+AUDIO_EXTS      = {'mp3', 'flac', 'm4a', 'aac', 'ogg', 'opus', 'wma', 'aiff', 'ape', 'wav'}
+VIDEO_EXTS      = {'mp4', 'mkv', 'avi', 'mov', 'wmv', 'm4v', 'webm', 'flv', 'mpg', 'mpeg', 'ts'}
+EML_EXTS        = {'eml', 'mbox'}
+MSG_EXTS        = {'msg'}
 SIZE_LIMIT_TEXT   = 50  * 1024 * 1024   # 50 MB
 SIZE_LIMIT_BINARY = 200 * 1024 * 1024   # 200 MB
 
