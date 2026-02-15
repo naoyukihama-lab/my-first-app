@@ -14,10 +14,12 @@ rename_app.py - GUI版ファイル自動リネームアプリ（CustomTkinter）
   pip install pypdf        # PDF テキスト抽出強化
   pip install olefile      # 旧 Office (.doc/.xls/.ppt) 抽出強化
   pip install tkinterdnd2  # ドラッグ＆ドロップ対応
+  pip install watchdog     # ホットフォルダ監視強化（なくてもポーリングで動作）
 """
 
 import re
 import threading
+import time
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
@@ -32,6 +34,14 @@ try:
     _DND_AVAILABLE = True
 except ImportError:
     _DND_AVAILABLE = False
+
+# ホットフォルダ監視（オプション）
+try:
+    from watchdog.observers import Observer                      # type: ignore
+    from watchdog.events import FileSystemEventHandler          # type: ignore
+    _WATCHDOG_AVAILABLE = True
+except ImportError:
+    _WATCHDOG_AVAILABLE = False
 
 _BASE = TkinterDnD.Tk if _DND_AVAILABLE else ctk.CTk
 
@@ -64,6 +74,60 @@ CHECK_OFF = '─'
 
 
 # ---------------------------------------------------------------------------
+# クラウドストレージのローカル同期フォルダを検出
+# ---------------------------------------------------------------------------
+
+def _detect_cloud_folders() -> dict[str, Path]:
+    """よく使われるクラウドストレージのローカル同期フォルダを検索"""
+    home = Path.home()
+    candidates: list[tuple[str, list[Path]]] = [
+        ('Google Drive',  [home / 'Google Drive',
+                           home / 'Google Drive (マイドライブ)',
+                           home / 'GoogleDrive',
+                           home / 'My Drive']),
+        ('Dropbox',       [home / 'Dropbox']),
+        ('OneDrive',      [home / 'OneDrive',
+                           *list(home.glob('OneDrive - *'))]),
+        ('Box',           [home / 'Box', home / 'Box Sync']),
+        ('iCloud Drive',  [home / 'iCloud Drive',
+                           home / 'Library' / 'Mobile Documents' / 'com~apple~CloudDocs']),
+        ('pCloud',        [home / 'pCloudDrive', home / 'pCloud Drive']),
+        ('Mega',          [home / 'MEGA', home / 'MEGAsync']),
+        ('Sync.com',      [home / 'Sync']),
+        ('Tresorit',      [home / 'Tresorit']),
+    ]
+    found: dict[str, Path] = {}
+    for name, paths in candidates:
+        for p in paths:
+            try:
+                if p.exists():
+                    found[name] = p
+                    break
+            except Exception:
+                pass
+    return found
+
+
+# ---------------------------------------------------------------------------
+# watchdog イベントハンドラ
+# ---------------------------------------------------------------------------
+
+if _WATCHDOG_AVAILABLE:
+    class _WatchHandler(FileSystemEventHandler):  # type: ignore[misc]
+        def __init__(self, callback):
+            super().__init__()
+            self._cb = callback
+
+        def on_created(self, event):
+            if not event.is_directory:
+                self._cb()
+
+        def on_moved(self, event):
+            if not event.is_directory:
+                self._cb()
+
+
+# ---------------------------------------------------------------------------
 # アプリ本体
 # ---------------------------------------------------------------------------
 
@@ -75,14 +139,20 @@ class RenameApp(_BASE):
         ctk.set_default_color_theme('blue')
 
         self.title('ファイル自動リネーム')
-        self.geometry('1060x620')
-        self.minsize(780, 440)
+        self.geometry('1100x640')
+        self.minsize(800, 460)
 
         self._plans: list[dict] = []
         self._selected_paths: list[str] = []
         self._sort_var   = tk.StringVar(value='ファイル名順')
         self._theme_var  = tk.StringVar(value='システム')
         self._sidebar_open = False
+
+        # ホットフォルダ監視状態
+        self._watching       = False
+        self._watch_path:   Path | None = None
+        self._watch_observer = None   # watchdog Observer
+        self._watch_seen:   set[Path] = set()
 
         self._build_ui()
         self._sync_root_bg()
@@ -98,22 +168,31 @@ class RenameApp(_BASE):
         top = ctk.CTkFrame(self, fg_color='transparent')
         top.pack(fill='x', padx=12, pady=(10, 4))
 
+        # ① フォルダ参照
         ctk.CTkButton(top, text='📂 フォルダ', command=self._select_folder,
-                      width=110).pack(side='left', padx=(0, 4))
+                      width=100).pack(side='left', padx=(0, 4))
+        # ② ファイル参照
         ctk.CTkButton(top, text='📄 ファイル', command=self._select_files,
-                      width=110).pack(side='left', padx=(0, 10))
+                      width=100).pack(side='left', padx=(0, 4))
+        # ③ クラウドストレージ
+        ctk.CTkButton(top, text='☁ クラウド', command=self._select_cloud,
+                      width=100).pack(side='left', padx=(0, 4))
+        # ④ 監視フォルダ（ホットフォルダ）
+        self._watch_btn = ctk.CTkButton(
+            top, text='👁 監視フォルダ', command=self._toggle_watch, width=110)
+        self._watch_btn.pack(side='left', padx=(0, 10))
 
         self._recursive_var = tk.BooleanVar(value=False)
         ctk.CTkCheckBox(top, text='サブフォルダ', variable=self._recursive_var,
                         command=self._on_recursive_toggle).pack(side='left', padx=(0, 10))
 
+        ctk.CTkButton(top, text='⚙  設定', command=self._toggle_sidebar,
+                      width=80).pack(side='right')
+
         hint = 'ここにドロップ / またはファイル・フォルダを選択してください' if _DND_AVAILABLE \
                else 'ファイルまたはフォルダを選択してください'
         self._path_label = ctk.CTkLabel(top, text=hint, text_color='gray', anchor='w')
         self._path_label.pack(side='left', fill='x', expand=True, padx=(0, 10))
-
-        ctk.CTkButton(top, text='⚙  設定', command=self._toggle_sidebar,
-                      width=80).pack(side='right')
 
         # --- 本体：テーブル + サイドバー ---
         body = ctk.CTkFrame(self, fg_color='transparent')
@@ -182,14 +261,13 @@ class RenameApp(_BASE):
         self._status_label.pack(side='left', padx=(16, 0))
 
     def _make_sidebar(self) -> ctk.CTkFrame:
-        """設定サイドバー（grid col=1 に収まる）"""
+        """設定サイドバー"""
         sb = ctk.CTkFrame(self._body, width=190, corner_radius=8)
 
         ctk.CTkLabel(sb, text='設定',
                      font=ctk.CTkFont(size=14, weight='bold')).pack(
                          padx=12, pady=(14, 6))
 
-        # 並び順
         ctk.CTkLabel(sb, text='並び順', anchor='w').pack(fill='x', padx=12, pady=(8, 2))
         ctk.CTkOptionMenu(
             sb, values=list(SORT_OPTIONS.keys()),
@@ -197,7 +275,6 @@ class RenameApp(_BASE):
             width=166,
         ).pack(padx=12, pady=(0, 10))
 
-        # テーマ
         ctk.CTkLabel(sb, text='テーマ', anchor='w').pack(fill='x', padx=12, pady=(4, 2))
         ctk.CTkSegmentedButton(
             sb, values=['ライト', 'ダーク', 'システム'],
@@ -238,7 +315,6 @@ class RenameApp(_BASE):
         self.after(50, self._sync_root_bg)
 
     def _sync_root_bg(self):
-        """ルートウィンドウの背景を CTk のテーマに合わせる"""
         mode = ctk.get_appearance_mode()
         bg = '#212121' if mode == 'Dark' else '#ebebeb'
         try:
@@ -247,7 +323,7 @@ class RenameApp(_BASE):
             pass
 
     # ------------------------------------------------------------------
-    # ファイル選択
+    # ① フォルダ参照 / ② ファイル参照
     # ------------------------------------------------------------------
 
     def _select_folder(self):
@@ -266,6 +342,167 @@ class RenameApp(_BASE):
         self._path_label.configure(text=f'{len(files)} ファイル選択済み',
                                     text_color=self._text_color())
         self._analyze()
+
+    # ------------------------------------------------------------------
+    # ③ クラウドストレージ選択
+    # ------------------------------------------------------------------
+
+    def _select_cloud(self):
+        found = _detect_cloud_folders()
+        if not found:
+            messagebox.showinfo(
+                'クラウドストレージ',
+                'クラウドストレージの同期フォルダが検出されませんでした。\n'
+                'Google Drive / Dropbox / OneDrive などのデスクトップアプリを\n'
+                'インストールして同期しているか確認してください。\n\n'
+                'フォルダを手動で選択します。',
+            )
+            self._select_folder()
+            return
+        self._show_cloud_dialog(found)
+
+    def _show_cloud_dialog(self, found: dict[str, Path]):
+        dlg = ctk.CTkToplevel(self)
+        dlg.title('クラウドストレージ')
+        dlg.geometry('400x320')
+        dlg.resizable(False, False)
+        dlg.grab_set()
+        dlg.focus_set()
+
+        ctk.CTkLabel(dlg, text='☁  クラウドストレージを選択',
+                     font=ctk.CTkFont(size=14, weight='bold')).pack(
+                         padx=20, pady=(16, 10))
+
+        selected_var = tk.StringVar(value=str(next(iter(found.values()))))
+
+        scroll_frame = ctk.CTkScrollableFrame(dlg, height=160)
+        scroll_frame.pack(fill='x', padx=20, pady=(0, 10))
+
+        for name, path in found.items():
+            row = ctk.CTkFrame(scroll_frame, fg_color='transparent')
+            row.pack(fill='x', pady=2)
+            ctk.CTkRadioButton(
+                row,
+                text=f'{name}',
+                variable=selected_var,
+                value=str(path),
+                font=ctk.CTkFont(size=12, weight='bold'),
+            ).pack(anchor='w')
+            ctk.CTkLabel(row, text=str(path), text_color='gray',
+                         font=ctk.CTkFont(size=10)).pack(anchor='w', padx=(24, 0))
+
+        btn_frame = ctk.CTkFrame(dlg, fg_color='transparent')
+        btn_frame.pack(fill='x', padx=20, pady=(0, 16))
+
+        def on_browse():
+            dlg.destroy()
+            self._select_folder()
+
+        def on_ok():
+            path_str = selected_var.get()
+            if path_str:
+                self._selected_paths = [path_str]
+                label = f'☁  {Path(path_str).name}  ({path_str})'
+                self._path_label.configure(text=label, text_color=self._text_color())
+                dlg.destroy()
+                self._analyze()
+
+        ctk.CTkButton(btn_frame, text='📂 その他を参照...', command=on_browse,
+                      width=140).pack(side='left')
+        ctk.CTkButton(btn_frame, text='選択', command=on_ok,
+                      width=100, fg_color='#27ae60',
+                      hover_color='#1e8449').pack(side='right')
+
+    # ------------------------------------------------------------------
+    # ④ ホットフォルダ（監視フォルダ）
+    # ------------------------------------------------------------------
+
+    def _toggle_watch(self):
+        if self._watching:
+            self._stop_watch()
+        else:
+            self._start_watch()
+
+    def _start_watch(self):
+        d = filedialog.askdirectory(title='監視するフォルダを選択')
+        if not d:
+            return
+        self._watch_path = Path(d)
+        self._watching   = True
+
+        # 初回分析
+        self._selected_paths = [d]
+        self._path_label.configure(
+            text=f'👁  監視中: {d}', text_color='orange')
+        self._watch_btn.configure(
+            text='⏹ 監視停止',
+            fg_color='#c0392b', hover_color='#922b21')
+        self._analyze()
+
+        if _WATCHDOG_AVAILABLE:
+            self._start_watchdog()
+        else:
+            self._start_polling()
+
+    def _start_watchdog(self):
+        handler = _WatchHandler(lambda: self.after(0, self._on_watch_changed))
+        obs = Observer()
+        obs.schedule(handler, str(self._watch_path), recursive=False)
+        obs.start()
+        self._watch_observer = obs
+
+    def _start_polling(self):
+        """watchdog がない場合は 2 秒おきにポーリング"""
+        try:
+            self._watch_seen = {
+                f for f in self._watch_path.iterdir() if f.is_file()  # type: ignore[union-attr]
+            }
+        except Exception:
+            self._watch_seen = set()
+
+        def poll():
+            while self._watching:
+                time.sleep(2)
+                try:
+                    current = {
+                        f for f in self._watch_path.iterdir() if f.is_file()  # type: ignore[union-attr]
+                    }
+                    if current != self._watch_seen:
+                        self._watch_seen = current
+                        self.after(0, self._on_watch_changed)
+                except Exception:
+                    pass
+
+        threading.Thread(target=poll, daemon=True).start()
+
+    def _on_watch_changed(self):
+        """監視フォルダに変化があったとき → 自動再分析"""
+        if not self._watching or not self._watch_path:
+            return
+        self._selected_paths = [str(self._watch_path)]
+        self._analyze()
+
+    def _stop_watch(self):
+        self._watching = False
+        if self._watch_observer is not None:
+            try:
+                self._watch_observer.stop()
+                self._watch_observer.join(timeout=2)
+            except Exception:
+                pass
+            self._watch_observer = None
+        self._watch_btn.configure(
+            text='👁 監視フォルダ',
+            fg_color=ctk.ThemeManager.theme['CTkButton']['fg_color'],
+            hover_color=ctk.ThemeManager.theme['CTkButton']['hover_color'],
+        )
+        self._set_status('監視停止', 'gray')
+        self._path_label.configure(
+            text='監視停止', text_color='gray')
+
+    # ------------------------------------------------------------------
+    # DnD
+    # ------------------------------------------------------------------
 
     def _on_recursive_toggle(self):
         if self._selected_paths:
@@ -351,7 +588,6 @@ class RenameApp(_BASE):
         self._update_status_and_btn(len(plans), ok_count)
 
     def _re_sort_and_repopulate(self):
-        """並び順変更時にデータを再ソートして再描画"""
         key = SORT_OPTIONS.get(self._sort_var.get(), lambda f: f.name.lower())
         try:
             self._plans.sort(key=lambda p: key(p['path']))  # type: ignore[operator]
@@ -430,11 +666,20 @@ class RenameApp(_BASE):
     # ------------------------------------------------------------------
 
     def _update_status_and_btn(self, total: int, ok_count: int):
-        self._set_status(f'{total} 件分析完了  /  {ok_count} 件リネーム可能')
+        watch_mark = '  👁 監視中' if self._watching else ''
+        self._set_status(f'{total} 件分析完了  /  {ok_count} 件リネーム可能{watch_mark}')
         self._rename_btn.configure(state='normal' if ok_count > 0 else 'disabled')
 
     def _set_status(self, text: str, color: str = 'gray'):
         self._status_label.configure(text=text, text_color=color)
+
+    # ------------------------------------------------------------------
+    # 終了時処理
+    # ------------------------------------------------------------------
+
+    def destroy(self):
+        self._stop_watch()
+        super().destroy()
 
 
 # ---------------------------------------------------------------------------
