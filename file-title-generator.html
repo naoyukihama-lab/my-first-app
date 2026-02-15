@@ -545,11 +545,11 @@
       webm:     { icon: '🎬', label: '動画',         reader: 'none' },
       // ドキュメント
       pdf:      { icon: '📕', label: 'PDF',          reader: 'pdf' },
-      doc:      { icon: '📘', label: 'Word',         reader: 'none' },
+      doc:      { icon: '📘', label: 'Word',         reader: 'binary' },
       docx:     { icon: '📘', label: 'Word',         reader: 'office' },
-      xls:      { icon: '📗', label: 'Excel',        reader: 'none' },
+      xls:      { icon: '📗', label: 'Excel',        reader: 'binary' },
       xlsx:     { icon: '📗', label: 'Excel',        reader: 'office' },
-      ppt:      { icon: '📙', label: 'PowerPoint',   reader: 'none' },
+      ppt:      { icon: '📙', label: 'PowerPoint',   reader: 'binary' },
       pptx:     { icon: '📙', label: 'PowerPoint',   reader: 'office' },
       // 圧縮
       zip:      { icon: '📦', label: 'ZIP',          reader: 'none' },
@@ -781,6 +781,69 @@
       return null;
     }
 
+    // 旧バイナリ Office 形式（.doc/.xls/.ppt）からタイトルを抽出
+    async function extractTitleFromBinaryOffice(file) {
+      const arrayBuffer = await file.arrayBuffer();
+      const buf = new Uint8Array(arrayBuffer);
+      const dv = new DataView(arrayBuffer);
+      const ext = file.name.split('.').pop().toLowerCase();
+
+      // OLE2 Compound Document シグネチャ確認 (D0 CF 11 E0)
+      if (buf[0] !== 0xD0 || buf[1] !== 0xCF || buf[2] !== 0x11 || buf[3] !== 0xE0) return null;
+
+      const limit = Math.min(buf.length, 512 * 1024); // 最初の512KBをスキャン
+
+      // .xls: BIFF8 BOUNDSHEET レコード（シート名）を探す
+      if (ext === 'xls') {
+        for (let i = 512; i < limit - 12; i++) {
+          if (buf[i] === 0x85 && buf[i + 1] === 0x00) {
+            const recSize = dv.getUint16(i + 2, true);
+            if (recSize >= 6 && i + 4 + recSize <= limit) {
+              const nameLen = buf[i + 8];
+              if (nameLen > 0 && nameLen < 64) {
+                const isUnicode = (buf[i + 9] & 1) === 1;
+                let name = '';
+                if (!isUnicode) {
+                  for (let j = 0; j < nameLen; j++) name += String.fromCharCode(buf[i + 10 + j]);
+                } else {
+                  for (let j = 0; j < nameLen; j++) {
+                    name += String.fromCharCode(dv.getUint16(i + 10 + j * 2, true));
+                  }
+                }
+                name = name.trim();
+                if (name.length >= 1 && !/^Sheet\d+$/i.test(name)) return name.substring(0, 80);
+              }
+            }
+          }
+        }
+        return null;
+      }
+
+      // .doc / .ppt: UTF-16LE テキストランをスキャン
+      let best = '';
+      let run = '';
+
+      for (let i = 512; i < limit - 1; i += 2) {
+        const lo = buf[i], hi = buf[i + 1];
+        const cp = lo | (hi << 8);
+
+        if (hi === 0 && lo >= 0x20 && lo < 0x7F) {
+          run += String.fromCharCode(lo);
+        } else if (cp >= 0x3041 && cp <= 0x9FFF) { // ひらがな〜CJK統合漢字
+          run += String.fromCharCode(cp);
+        } else {
+          const t = run.trim();
+          if (t.length >= 5 && t.length > best.length && /[A-Za-z\u3041-\u9FFF]/.test(t)) {
+            best = t;
+          }
+          if (best.length >= 10) break;
+          run = '';
+        }
+      }
+
+      return best.length >= 5 ? best.substring(0, 80) : null;
+    }
+
     // タイトル生成メイン
     async function generateTitle(file) {
       const nameParts = file.name.split('.');
@@ -811,6 +874,14 @@
       } else if (fileType.reader === 'office' && file.size < 20 * 1024 * 1024) {
         try {
           const extracted = await extractTitleFromOffice(file);
+          if (extracted && extracted.trim().length > 0) {
+            title = extracted;
+            source = 'content';
+          }
+        } catch {}
+      } else if (fileType.reader === 'binary' && file.size < 20 * 1024 * 1024) {
+        try {
+          const extracted = await extractTitleFromBinaryOffice(file);
           if (extracted && extracted.trim().length > 0) {
             title = extracted;
             source = 'content';
