@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-rename_app.py - GUI版ファイル自動リネームアプリ（Tkinter）
+rename_app.py - GUI版ファイル自動リネームアプリ（CustomTkinter）
 
 使い方:
   python rename_app.py
 
 必要なもの:
-  - Python 3.10 以上（tkinter は標準添付）
+  - Python 3.10 以上
+  - pip install customtkinter
   - rename_files.py と同じフォルダに配置
 
 オプションライブラリ:
@@ -21,6 +22,8 @@ import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
+import customtkinter as ctk
+
 from rename_files import collect_files, generate_title, sanitize_filename
 
 # ドラッグ＆ドロップ（オプション）
@@ -30,7 +33,18 @@ try:
 except ImportError:
     _DND_AVAILABLE = False
 
-_TkBase = TkinterDnD.Tk if _DND_AVAILABLE else tk.Tk
+_BASE = TkinterDnD.Tk if _DND_AVAILABLE else ctk.CTk
+
+# ---------------------------------------------------------------------------
+# 並び順の定義
+# ---------------------------------------------------------------------------
+
+SORT_OPTIONS: dict[str, object] = {
+    'ファイル名順':         lambda f: f.name.lower(),
+    '更新日時（新→古）':   lambda f: -f.stat().st_mtime,
+    '更新日時（古→新）':   lambda f:  f.stat().st_mtime,
+    '拡張子順':             lambda f: (f.suffix.lower(), f.name.lower()),
+}
 
 # ---------------------------------------------------------------------------
 # 定数
@@ -48,69 +62,73 @@ ST_EXISTS = 'exists'
 CHECK_ON  = '✓'
 CHECK_OFF = '─'
 
-COLOR_OK     = '#1a7f37'
-COLOR_SAME   = '#888888'
-COLOR_EXISTS = '#cf222e'
-COLOR_BG     = '#f6f8fa'
-
 
 # ---------------------------------------------------------------------------
 # アプリ本体
 # ---------------------------------------------------------------------------
 
-class RenameApp(_TkBase):
+class RenameApp(_BASE):
 
     def __init__(self):
         super().__init__()
+        ctk.set_appearance_mode('system')
+        ctk.set_default_color_theme('blue')
+
         self.title('ファイル自動リネーム')
-        self.geometry('960x560')
-        self.minsize(720, 400)
-        self.configure(bg=COLOR_BG)
+        self.geometry('1060x620')
+        self.minsize(780, 440)
 
         self._plans: list[dict] = []
         self._selected_paths: list[str] = []
+        self._sort_var   = tk.StringVar(value='ファイル名順')
+        self._theme_var  = tk.StringVar(value='システム')
+        self._sidebar_open = False
 
         self._build_ui()
+        self._sync_root_bg()
 
     # ------------------------------------------------------------------
     # UI 構築
     # ------------------------------------------------------------------
 
     def _build_ui(self):
-        style = ttk.Style(self)
-        style.theme_use('clam')
-        style.configure('TFrame',     background=COLOR_BG)
-        style.configure('TLabel',     background=COLOR_BG)
-        style.configure('TCheckbutton', background=COLOR_BG)
-        style.configure('Accent.TButton', font=('', 10, 'bold'))
-        style.configure('Treeview',       rowheight=26)
-        style.configure('Treeview.Heading', font=('', 9, 'bold'))
+        self._setup_treeview_style()
 
-        # --- トップ：パス選択 ---
-        top = ttk.Frame(self, padding=(10, 8, 10, 4))
-        top.pack(fill='x', side='top')
+        # --- トップバー ---
+        top = ctk.CTkFrame(self, fg_color='transparent')
+        top.pack(fill='x', padx=12, pady=(10, 4))
 
-        ttk.Button(top, text='📂  フォルダを選択', command=self._select_folder,
-                   width=18).pack(side='left', padx=(0, 4))
-        ttk.Button(top, text='📄  ファイルを選択', command=self._select_files,
-                   width=18).pack(side='left', padx=(0, 8))
+        ctk.CTkButton(top, text='📂 フォルダ', command=self._select_folder,
+                      width=110).pack(side='left', padx=(0, 4))
+        ctk.CTkButton(top, text='📄 ファイル', command=self._select_files,
+                      width=110).pack(side='left', padx=(0, 10))
 
         self._recursive_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(top, text='サブフォルダも対象', variable=self._recursive_var,
-                        command=self._on_recursive_toggle).pack(side='left', padx=(0, 8))
+        ctk.CTkCheckBox(top, text='サブフォルダ', variable=self._recursive_var,
+                        command=self._on_recursive_toggle).pack(side='left', padx=(0, 10))
 
-        hint = 'ここにドロップ可 / フォルダまたはファイルを選択してください' if _DND_AVAILABLE \
-               else 'フォルダまたはファイルを選択してください'
-        self._path_label = ttk.Label(top, text=hint, foreground='gray')
-        self._path_label.pack(side='left', fill='x', expand=True)
+        hint = 'ここにドロップ / またはファイル・フォルダを選択してください' if _DND_AVAILABLE \
+               else 'ファイルまたはフォルダを選択してください'
+        self._path_label = ctk.CTkLabel(top, text=hint, text_color='gray', anchor='w')
+        self._path_label.pack(side='left', fill='x', expand=True, padx=(0, 10))
 
-        # --- 中段：テーブル ---
-        table_frame = ttk.Frame(self, padding=(10, 0, 10, 0))
-        table_frame.pack(fill='both', expand=True)
+        ctk.CTkButton(top, text='⚙  設定', command=self._toggle_sidebar,
+                      width=80).pack(side='right')
+
+        # --- 本体：テーブル + サイドバー ---
+        body = ctk.CTkFrame(self, fg_color='transparent')
+        body.pack(fill='both', expand=True, padx=12, pady=0)
+        body.columnconfigure(0, weight=1)
+        body.rowconfigure(0, weight=1)
+        self._body = body
+
+        # テーブル
+        table_frame = ctk.CTkFrame(body, fg_color='transparent')
+        table_frame.grid(row=0, column=0, sticky='nsew')
 
         cols = (COL_CHECK, COL_OLD, COL_NEW, COL_SOURCE)
         self._tree = ttk.Treeview(table_frame, columns=cols, show='headings',
-                                   selectmode='none')
+                                   selectmode='none', style='App.Treeview')
 
         self._tree.heading(COL_CHECK,  text='対象')
         self._tree.heading(COL_OLD,    text='現在のファイル名')
@@ -118,48 +136,115 @@ class RenameApp(_TkBase):
         self._tree.heading(COL_SOURCE, text='取得元')
 
         self._tree.column(COL_CHECK,  width=54,  minwidth=54,  stretch=False, anchor='center')
-        self._tree.column(COL_OLD,    width=310, minwidth=150, stretch=True)
-        self._tree.column(COL_NEW,    width=310, minwidth=150, stretch=True)
+        self._tree.column(COL_OLD,    width=320, minwidth=150, stretch=True)
+        self._tree.column(COL_NEW,    width=320, minwidth=150, stretch=True)
         self._tree.column(COL_SOURCE, width=100, minwidth=80,  stretch=False, anchor='center')
 
-        self._tree.tag_configure(ST_OK,     foreground=COLOR_OK)
-        self._tree.tag_configure(ST_SAME,   foreground=COLOR_SAME)
-        self._tree.tag_configure(ST_EXISTS, foreground=COLOR_EXISTS)
+        self._tree.tag_configure(ST_OK,     foreground='#2ecc71')
+        self._tree.tag_configure(ST_SAME,   foreground='#888888')
+        self._tree.tag_configure(ST_EXISTS, foreground='#e74c3c')
 
         vsb = ttk.Scrollbar(table_frame, orient='vertical',   command=self._tree.yview)
         hsb = ttk.Scrollbar(table_frame, orient='horizontal', command=self._tree.xview)
         self._tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
-
         hsb.pack(side='bottom', fill='x')
         vsb.pack(side='right',  fill='y')
         self._tree.pack(fill='both', expand=True)
-
         self._tree.bind('<Button-1>', self._on_cell_click)
 
-        # ドラッグ＆ドロップ登録
+        # 設定サイドバー（初期は非表示）
+        self._sidebar = self._make_sidebar()
+
+        # DnD
         if _DND_AVAILABLE:
-            for widget in (self, self._tree):
-                widget.drop_target_register(DND_FILES)
-                widget.dnd_bind('<<Drop>>', self._on_drop)
+            for w in (self, self._tree):
+                w.drop_target_register(DND_FILES)
+                w.dnd_bind('<<Drop>>', self._on_drop)
 
-        # --- ボトム：操作ボタン + ステータス ---
-        bottom = ttk.Frame(self, padding=(10, 6, 10, 8))
-        bottom.pack(fill='x', side='bottom')
+        # --- ボトムバー ---
+        bottom = ctk.CTkFrame(self, fg_color='transparent')
+        bottom.pack(fill='x', padx=12, pady=(4, 10))
 
-        ttk.Button(bottom, text='すべて選択', command=self._select_all,
-                   width=12).pack(side='left', padx=(0, 4))
-        ttk.Button(bottom, text='すべて解除', command=self._deselect_all,
-                   width=12).pack(side='left')
+        ctk.CTkButton(bottom, text='すべて選択', command=self._select_all,
+                      width=100).pack(side='left', padx=(0, 4))
+        ctk.CTkButton(bottom, text='すべて解除', command=self._deselect_all,
+                      width=100).pack(side='left')
 
-        self._rename_btn = ttk.Button(bottom, text='リネーム実行  ▶',
-                                      command=self._do_rename,
-                                      style='Accent.TButton',
-                                      state='disabled', width=18)
+        self._rename_btn = ctk.CTkButton(
+            bottom, text='リネーム実行  ▶', command=self._do_rename,
+            state='disabled', width=160,
+            fg_color='#27ae60', hover_color='#1e8449', text_color='white',
+        )
         self._rename_btn.pack(side='right')
 
-        self._status_var = tk.StringVar(value='Ready')
-        ttk.Label(bottom, textvariable=self._status_var,
-                  foreground='gray').pack(side='left', padx=(16, 0))
+        self._status_label = ctk.CTkLabel(bottom, text='Ready',
+                                           text_color='gray', anchor='w')
+        self._status_label.pack(side='left', padx=(16, 0))
+
+    def _make_sidebar(self) -> ctk.CTkFrame:
+        """設定サイドバー（grid col=1 に収まる）"""
+        sb = ctk.CTkFrame(self._body, width=190, corner_radius=8)
+
+        ctk.CTkLabel(sb, text='設定',
+                     font=ctk.CTkFont(size=14, weight='bold')).pack(
+                         padx=12, pady=(14, 6))
+
+        # 並び順
+        ctk.CTkLabel(sb, text='並び順', anchor='w').pack(fill='x', padx=12, pady=(8, 2))
+        ctk.CTkOptionMenu(
+            sb, values=list(SORT_OPTIONS.keys()),
+            variable=self._sort_var, command=self._on_sort_change,
+            width=166,
+        ).pack(padx=12, pady=(0, 10))
+
+        # テーマ
+        ctk.CTkLabel(sb, text='テーマ', anchor='w').pack(fill='x', padx=12, pady=(4, 2))
+        ctk.CTkSegmentedButton(
+            sb, values=['ライト', 'ダーク', 'システム'],
+            variable=self._theme_var, command=self._on_theme_change,
+            width=166,
+        ).pack(padx=12, pady=(0, 16))
+
+        return sb
+
+    def _setup_treeview_style(self):
+        style = ttk.Style()
+        style.theme_use('clam')
+        style.configure('App.Treeview',         rowheight=28, font=('', 10))
+        style.configure('App.Treeview.Heading', font=('', 9, 'bold'))
+
+    # ------------------------------------------------------------------
+    # サイドバー開閉
+    # ------------------------------------------------------------------
+
+    def _toggle_sidebar(self):
+        if self._sidebar_open:
+            self._sidebar.grid_forget()
+        else:
+            self._sidebar.grid(row=0, column=1, sticky='ns', padx=(6, 0))
+        self._sidebar_open = not self._sidebar_open
+
+    # ------------------------------------------------------------------
+    # 設定変更ハンドラ
+    # ------------------------------------------------------------------
+
+    def _on_sort_change(self, _=None):
+        if self._plans:
+            self._re_sort_and_repopulate()
+
+    def _on_theme_change(self, value: str):
+        mapping = {'ライト': 'light', 'ダーク': 'dark', 'システム': 'system'}
+        ctk.set_appearance_mode(mapping.get(value, 'system'))
+        self.after(50, self._sync_root_bg)
+
+    def _sync_root_bg(self):
+        """ルートウィンドウの背景を CTk のテーマに合わせる"""
+        mode = ctk.get_appearance_mode()
+        bg = '#212121' if mode == 'Dark' else '#ebebeb'
+        try:
+            self.configure(bg=bg)
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # ファイル選択
@@ -170,7 +255,7 @@ class RenameApp(_TkBase):
         if not d:
             return
         self._selected_paths = [d]
-        self._path_label.config(text=d, foreground='black')
+        self._path_label.configure(text=d, text_color=self._text_color())
         self._analyze()
 
     def _select_files(self):
@@ -178,7 +263,8 @@ class RenameApp(_TkBase):
         if not files:
             return
         self._selected_paths = list(files)
-        self._path_label.config(text=f'{len(files)} ファイル選択済み', foreground='black')
+        self._path_label.configure(text=f'{len(files)} ファイル選択済み',
+                                    text_color=self._text_color())
         self._analyze()
 
     def _on_recursive_toggle(self):
@@ -186,9 +272,7 @@ class RenameApp(_TkBase):
             self._analyze()
 
     def _on_drop(self, event) -> None:
-        """ドラッグ＆ドロップされたファイル／フォルダを受け取る"""
         raw: str = event.data
-        # tkinterdnd2 はスペースを含むパスを {} で囲んで返す
         paths: list[str] = re.findall(r'\{([^}]+)\}', raw)
         remaining = re.sub(r'\{[^}]+\}', '', raw).strip()
         if remaining:
@@ -198,26 +282,36 @@ class RenameApp(_TkBase):
             return
         self._selected_paths = paths
         label = f'{len(paths)} 件をドロップ' if len(paths) > 1 else paths[0]
-        self._path_label.config(text=label, foreground='black')
+        self._path_label.configure(text=label, text_color=self._text_color())
         self._analyze()
+
+    def _text_color(self) -> str:
+        return 'white' if ctk.get_appearance_mode() == 'Dark' else 'black'
 
     # ------------------------------------------------------------------
     # 分析（バックグラウンドスレッド）
     # ------------------------------------------------------------------
 
+    def _sorted_files(self, files: list[Path]) -> list[Path]:
+        key = SORT_OPTIONS.get(self._sort_var.get(), lambda f: f.name.lower())
+        try:
+            return sorted(files, key=key)  # type: ignore[arg-type]
+        except Exception:
+            return files
+
     def _analyze(self):
         if not self._selected_paths:
             return
-        self._set_status('分析中...', 'blue')
-        self._rename_btn.config(state='disabled')
+        self._set_status('分析中...', 'dodgerblue')
+        self._rename_btn.configure(state='disabled')
         self._tree.delete(*self._tree.get_children())
         self._plans.clear()
 
-        paths = self._selected_paths[:]
+        paths     = self._selected_paths[:]
         recursive = self._recursive_var.get()
 
         def worker():
-            files = collect_files(paths, recursive)
+            files = self._sorted_files(collect_files(paths, recursive))
             plans = []
             for f in files:
                 title, source = generate_title(f)
@@ -253,26 +347,32 @@ class RenameApp(_TkBase):
             self._tree.insert('', 'end',
                               values=(check, p['path'].name, p['new_name'], src_label),
                               tags=(p['status'],))
-
         ok_count = sum(1 for p in plans if p['selected'])
         self._update_status_and_btn(len(plans), ok_count)
+
+    def _re_sort_and_repopulate(self):
+        """並び順変更時にデータを再ソートして再描画"""
+        key = SORT_OPTIONS.get(self._sort_var.get(), lambda f: f.name.lower())
+        try:
+            self._plans.sort(key=lambda p: key(p['path']))  # type: ignore[operator]
+        except Exception:
+            pass
+        self._tree.delete(*self._tree.get_children())
+        self._populate(self._plans)
 
     # ------------------------------------------------------------------
     # チェックボックストグル
     # ------------------------------------------------------------------
 
     def _on_cell_click(self, event: tk.Event):
-        region = self._tree.identify_region(event.x, event.y)
-        if region != 'cell':
+        if self._tree.identify_region(event.x, event.y) != 'cell':
             return
-        col = self._tree.identify_column(event.x)
-        if col != '#1':
+        if self._tree.identify_column(event.x) != '#1':
             return
         row_id = self._tree.identify_row(event.y)
         if not row_id:
             return
-        idx = self._tree.index(row_id)
-        plan = self._plans[idx]
+        plan = self._plans[self._tree.index(row_id)]
         if plan['status'] != ST_OK:
             return
         plan['selected'] = not plan['selected']
@@ -310,7 +410,6 @@ class RenameApp(_TkBase):
         if not messagebox.askyesno('確認',
                                    f'{len(targets)} 件のファイルをリネームします。\n続行しますか？'):
             return
-
         done = 0
         errors: list[str] = []
         for p in targets:
@@ -324,25 +423,18 @@ class RenameApp(_TkBase):
         if errors:
             msg += f'\n\nエラー ({len(errors)} 件):\n' + '\n'.join(errors[:10])
         messagebox.showinfo('完了', msg)
-
-        # 同じフォルダを再分析して表示を更新
         self._analyze()
 
     # ------------------------------------------------------------------
-    # ステータスバー更新
+    # ステータス
     # ------------------------------------------------------------------
 
     def _update_status_and_btn(self, total: int, ok_count: int):
-        self._set_status(f'{total} 件分析完了  /  {ok_count} 件リネーム可能', 'black')
-        self._rename_btn.config(state='normal' if ok_count > 0 else 'disabled')
+        self._set_status(f'{total} 件分析完了  /  {ok_count} 件リネーム可能')
+        self._rename_btn.configure(state='normal' if ok_count > 0 else 'disabled')
 
-    def _set_status(self, text: str, color: str = 'black'):
-        self._status_var.set(text)
-        for w in self.pack_slaves():
-            if isinstance(w, ttk.Frame):
-                for child in w.pack_slaves():
-                    if isinstance(child, ttk.Label) and child.cget('textvariable') == str(self._status_var):
-                        child.config(foreground=color)
+    def _set_status(self, text: str, color: str = 'gray'):
+        self._status_label.configure(text=text, text_color=color)
 
 
 # ---------------------------------------------------------------------------
