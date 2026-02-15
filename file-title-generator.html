@@ -558,6 +558,25 @@
 
     // ファイル名のクリーニング（タイトル化）
     function cleanFilename(name) {
+      // YYYYMMDDHHMMSS（14桁）
+      const dt14 = name.match(/^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})$/);
+      if (dt14) return `${dt14[1]}年${dt14[2]}月${dt14[3]}日 ${dt14[4]}:${dt14[5]}:${dt14[6]}`;
+
+      // YYYYMMDDHHMM（12桁）
+      const dt12 = name.match(/^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})$/);
+      if (dt12) return `${dt12[1]}年${dt12[2]}月${dt12[3]}日 ${dt12[4]}:${dt12[5]}`;
+
+      // YYYYMMDD（8桁）
+      const d8 = name.match(/^(\d{4})(\d{2})(\d{2})$/);
+      if (d8) return `${d8[1]}年${d8[2]}月${d8[3]}日`;
+
+      // YYYYMM + テキスト（例: 202206kohan）
+      const ym = name.match(/^(\d{4})(\d{2})([^\d].*)$/);
+      if (ym) {
+        const rest = cleanFilename(ym[3].replace(/^[-_\s]+/, ''));
+        return `${ym[1]}年${ym[2]}月 ${rest}`;
+      }
+
       return name
         .replace(/[-_\.]+/g, ' ')            // 区切り文字をスペースに
         .replace(/([a-z])([A-Z])/g, '$1 $2') // camelCase を分割
