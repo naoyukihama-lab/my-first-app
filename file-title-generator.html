@@ -389,6 +389,31 @@
       color: var(--text);
     }
 
+    .rename-btn {
+      display: flex;
+      align-items: center;
+      gap: 0.4rem;
+      padding: 0.4rem 1rem;
+      background: rgba(16, 185, 129, 0.12);
+      border: 1px solid rgba(16, 185, 129, 0.35);
+      border-radius: 999px;
+      color: #34d399;
+      font-size: 0.8rem;
+      cursor: pointer;
+      font-family: inherit;
+      transition: all 0.2s ease;
+    }
+
+    .rename-btn:hover {
+      background: rgba(16, 185, 129, 0.25);
+      color: #6ee7b7;
+    }
+
+    .rename-btn.done {
+      background: rgba(16, 185, 129, 0.25);
+      color: #6ee7b7;
+    }
+
     /* Toast */
     .toast {
       position: fixed;
@@ -924,6 +949,7 @@
     const toastEl = document.getElementById('toast');
 
     let processedCount = 0;
+    const fileStore = new Map(); // cardId → File オブジェクトを保持
 
     // ドロップゾーンのクリック
     fileBtn.addEventListener('click', (e) => {
@@ -1001,8 +1027,12 @@
 
     // カード作成
     function createFileCard(file, title, fileType, ext, source) {
+      const cardId = `card-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      fileStore.set(cardId, file);
+
       const div = document.createElement('div');
       div.className = 'file-card';
+      div.dataset.cardId = cardId;
 
       const sourceBadge = source === 'content'
         ? `<span class="source-badge source-content">コンテンツから抽出</span>`
@@ -1029,6 +1059,9 @@
             </button>
             <button class="edit-btn" onclick="toggleEdit(this)">
               <span>✏️</span> 編集
+            </button>
+            <button class="rename-btn" onclick="downloadRenamed(this)">
+              <span>💾</span> リネームして保存
             </button>
             <input type="text" class="title-input" value="${escHtml(title)}"
               placeholder="タイトルを編集..."
@@ -1123,10 +1156,51 @@
       titleEl.textContent = input.value || titleEl.dataset.title;
     }
 
+    // ファイル名に使えない文字を除去
+    function sanitizeFilename(name) {
+      return name
+        .replace(/[\\/:*?"<>|]/g, '_')   // Windows/UNIX 禁止文字を置換
+        .replace(/\s+/g, ' ')            // 連続スペースを1つに
+        .replace(/^[\s.]+|[\s.]+$/g, '') // 先頭・末尾のスペースとドットを除去
+        .substring(0, 200) || 'untitled';
+    }
+
+    // 生成タイトルでリネームしてダウンロード
+    function downloadRenamed(btn) {
+      const card = btn.closest('.file-card');
+      const file = fileStore.get(card.dataset.cardId);
+      if (!file) return;
+
+      const titleEl = card.querySelector('.generated-title');
+      const title = (titleEl.dataset.title || titleEl.textContent).trim();
+
+      // 元の拡張子を保持
+      const dotIndex = file.name.lastIndexOf('.');
+      const ext = dotIndex !== -1 ? file.name.slice(dotIndex) : '';
+      const newName = sanitizeFilename(title) + ext;
+
+      const url = URL.createObjectURL(file);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = newName;
+      a.click();
+      URL.revokeObjectURL(url);
+
+      const prev = btn.innerHTML;
+      btn.classList.add('done');
+      btn.innerHTML = '<span>✅</span> 保存済み';
+      showToast(`「${newName}」として保存します`);
+      setTimeout(() => {
+        btn.classList.remove('done');
+        btn.innerHTML = prev;
+      }, 2000);
+    }
+
     // 結果クリア
     function clearResults() {
       resultsEl.innerHTML = '';
       processedCount = 0;
+      fileStore.clear();
     }
 
     // トースト通知
