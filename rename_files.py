@@ -12,12 +12,14 @@ rename_files.py - ファイル内容からタイトルを抽出して自動リ�
 
 依存ライブラリ（オプション）:
   pip install pypdf          # PDF テキスト抽出を強化（なくても動作）
+  pip install olefile        # 旧 Office (.doc/.xls/.ppt) 抽出を強化（なくても動作）
 """
 
 import argparse
 import json
 import os
 import re
+import struct
 import sys
 import zipfile
 from pathlib import Path
@@ -233,6 +235,202 @@ def extract_title_from_office(path: Path, ext: str) -> str | None:
 
 
 # ---------------------------------------------------------------------------
+# 旧 Office バイナリ形式（.doc / .xls / .ppt）からタイトル抽出
+# ---------------------------------------------------------------------------
+
+def _parse_prop_set_title(data: bytes) -> str | None:
+    """Windows PROPSET（SummaryInformation）から PIDSI_TITLE (PID=2) を取得"""
+    try:
+        if len(data) < 48:
+            return None
+        # PROPERTYSETHEADER: ByteOrder(2) Version(2) SystemID(4) CLSID(16) cSections(4)
+        c_sections = struct.unpack_from('<I', data, 24)[0]
+        if c_sections < 1 or len(data) < 48:
+            return None
+        # First section: FMTID(16) + Offset(4) at byte 28
+        section_offset = struct.unpack_from('<I', data, 44)[0]
+        if section_offset + 8 > len(data):
+            return None
+        # Section: Size(4) + Count(4) + IDOFFSET pairs
+        prop_count = struct.unpack_from('<I', data, section_offset + 4)[0]
+        for i in range(min(prop_count, 200)):
+            entry_off = section_offset + 8 + i * 8
+            if entry_off + 8 > len(data):
+                break
+            pid, prop_off = struct.unpack_from('<II', data, entry_off)
+            if pid != 2:  # PIDSI_TITLE
+                continue
+            abs_off = section_offset + prop_off
+            if abs_off + 8 > len(data):
+                break
+            vt_type = struct.unpack_from('<I', data, abs_off)[0]
+            if vt_type == 0x1E:  # VT_LPSTR (ANSI)
+                strlen = struct.unpack_from('<I', data, abs_off + 4)[0]
+                raw = data[abs_off + 8: abs_off + 8 + strlen].rstrip(b'\x00')
+                title = raw.decode('cp932', errors='ignore') or raw.decode('latin-1', errors='ignore')
+                return title.strip() or None
+            elif vt_type == 0x1F:  # VT_LPWSTR (Unicode)
+                wlen = struct.unpack_from('<I', data, abs_off + 4)[0]
+                raw = data[abs_off + 8: abs_off + 8 + wlen * 2]
+                title = raw.decode('utf-16-le', errors='ignore').rstrip('\x00')
+                return title.strip() or None
+    except Exception:
+        pass
+    return None
+
+
+def _extract_xls_sheet_names(data: bytes) -> list[str]:
+    """BIFF8 データストリームから BOUNDSHEET レコード（0x0085）でシート名を収集"""
+    names: list[str] = []
+    i = 0
+    while i < len(data) - 4:
+        try:
+            rec_type = struct.unpack_from('<H', data, i)[0]
+            rec_len  = struct.unpack_from('<H', data, i + 2)[0]
+        except struct.error:
+            break
+        if rec_type == 0x0085 and rec_len >= 6:  # BOUNDSHEET
+            rec = data[i + 4: i + 4 + rec_len]
+            if len(rec) >= 6:
+                name_len = rec[4]
+                flag     = rec[5]
+                raw      = rec[6:]
+                if flag & 0x01:  # Unicode
+                    name = raw[:name_len * 2].decode('utf-16-le', errors='ignore')
+                else:            # Latin / MBCS
+                    name = raw[:name_len].decode('cp932', errors='ignore') \
+                           or raw[:name_len].decode('latin-1', errors='ignore')
+                if name.strip():
+                    names.append(name.strip())
+        i += 4 + max(0, rec_len)
+    return names
+
+
+def _extract_ppt_texts(data: bytes) -> list[str]:
+    """PowerPoint Document ストリームから TextCharsAtom / TextBytesAtom を収集"""
+    texts: list[str] = []
+    i = 0
+    while i < len(data) - 8:
+        try:
+            rec_type = struct.unpack_from('<H', data, i + 2)[0]
+            rec_len  = struct.unpack_from('<I', data, i + 4)[0]
+        except struct.error:
+            break
+        if rec_len > 10 * 1024 * 1024:  # 異常に大きいレコードはスキップ
+            i += 1
+            continue
+        if rec_type == 0x0FA0 and rec_len > 0:  # TextCharsAtom (UTF-16LE)
+            raw  = data[i + 8: i + 8 + rec_len]
+            text = raw.decode('utf-16-le', errors='ignore').rstrip('\x00')
+            if text.strip():
+                texts.append(text.strip())
+        elif rec_type == 0x0FA8 and rec_len > 0:  # TextBytesAtom (Latin)
+            raw  = data[i + 8: i + 8 + rec_len]
+            text = raw.decode('latin-1', errors='ignore').rstrip('\x00')
+            if text.strip():
+                texts.append(text.strip())
+        i += 8 + max(0, rec_len)
+    return texts
+
+
+def _scan_utf16le_strings(data: bytes, min_len: int = 6) -> list[str]:
+    """バイナリデータから UTF-16LE テキスト文字列をスキャン（.doc フォールバック用）"""
+    results: list[str] = []
+    i = 0
+    n = len(data)
+    while i < n - 1:
+        if 0x20 <= data[i] <= 0x7E and data[i + 1] == 0x00:
+            j = i
+            while j + 1 < n and 0x20 <= data[j] <= 0x7E and data[j + 1] == 0x00:
+                j += 2
+            char_count = (j - i) // 2
+            if char_count >= min_len:
+                text = data[i:j].decode('utf-16-le', errors='ignore').strip()
+                if text:
+                    results.append(text)
+            i = j + 2
+        else:
+            i += 1
+    return results
+
+
+def extract_title_from_old_office(path: Path, ext: str) -> str | None:
+    """旧 Office 形式（.doc / .xls / .ppt）からタイトルを抽出"""
+
+    # --- 1. olefile 経由（最も正確） ---
+    try:
+        import olefile  # type: ignore
+        with olefile.OleFileIO(str(path)) as ole:
+            # SummaryInformation の dc:title を最優先
+            si = '\x05SummaryInformation'
+            if ole.exists(si):
+                title = _parse_prop_set_title(ole.openstream(si).read())
+                if title:
+                    return title[:80]
+
+            # ストリームからコンテンツを取得
+            if ext == 'xls':
+                for stream in ('Workbook', 'Book'):
+                    if ole.exists(stream):
+                        names = _extract_xls_sheet_names(ole.openstream(stream).read())
+                        if names:
+                            return names[0][:80]
+
+            elif ext == 'ppt':
+                if ole.exists('PowerPoint Document'):
+                    texts = _extract_ppt_texts(ole.openstream('PowerPoint Document').read())
+                    for t in texts:
+                        if len(t) >= 4:
+                            return t[:80]
+
+            elif ext == 'doc':
+                if ole.exists('WordDocument'):
+                    raw = ole.openstream('WordDocument').read()
+                    for s in _scan_utf16le_strings(raw, min_len=6):
+                        if re.match(r'^[A-Za-z\u3040-\u9FFF\u4E00-\u9FFF]', s) and len(s) >= 4:
+                            return s[:80]
+    except ImportError:
+        pass
+    except Exception:
+        pass
+
+    # --- 2. バイナリスキャン（olefile なし・フォールバック） ---
+    try:
+        with open(path, 'rb') as f:
+            data = f.read()
+
+        # SummaryInformation はファイル内に固定マジックで識別可能
+        magic = b'\x05SummaryInformation'
+        idx = data.find(magic)
+        if idx != -1:
+            # マジックの後ろにプロパティセットが続くことが多い
+            chunk = data[idx + len(magic): idx + len(magic) + 4096]
+            title = _parse_prop_set_title(chunk)
+            if title:
+                return title[:80]
+
+        if ext == 'xls':
+            names = _extract_xls_sheet_names(data)
+            if names:
+                return names[0][:80]
+
+        elif ext == 'ppt':
+            texts = _extract_ppt_texts(data)
+            for t in texts:
+                if len(t) >= 4:
+                    return t[:80]
+
+        elif ext == 'doc':
+            for s in _scan_utf16le_strings(data, min_len=6):
+                if re.match(r'^[A-Za-z\u3040-\u9FFF\u4E00-\u9FFF]', s) and len(s) >= 4:
+                    return s[:80]
+    except Exception:
+        pass
+
+    return None
+
+
+# ---------------------------------------------------------------------------
 # タイトル生成メイン
 # ---------------------------------------------------------------------------
 
@@ -244,7 +442,8 @@ TEXT_EXTS = {
     'py', 'rb', 'php', 'java', 'kt', 'swift', 'go', 'rs',
     'cpp', 'c', 'cs', 'sh', 'bash', 'zsh', 'ps1', 'sql', 'r', 'lua', 'svg',
 }
-OFFICE_EXTS = {'docx', 'xlsx', 'pptx'}
+OFFICE_EXTS     = {'docx', 'xlsx', 'pptx'}
+OLD_OFFICE_EXTS = {'doc', 'xls', 'ppt'}
 SIZE_LIMIT_TEXT   = 5  * 1024 * 1024   # 5 MB
 SIZE_LIMIT_BINARY = 20 * 1024 * 1024   # 20 MB
 
@@ -284,6 +483,15 @@ def generate_title(path: Path) -> tuple[str, str]:
     elif ext in OFFICE_EXTS and size < SIZE_LIMIT_BINARY:
         try:
             extracted = extract_title_from_office(path, ext)
+            if extracted and extracted.strip():
+                title = extracted.strip()
+                source = 'content'
+        except Exception:
+            pass
+
+    elif ext in OLD_OFFICE_EXTS and size < SIZE_LIMIT_BINARY:
+        try:
+            extracted = extract_title_from_old_office(path, ext)
             if extracted and extracted.strip():
                 title = extracted.strip()
                 source = 'content'
