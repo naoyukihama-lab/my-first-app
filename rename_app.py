@@ -461,6 +461,10 @@ class RenameApp(_BASE):
 
     def _on_mode_change(self, mode: str):
         """モードに応じてアクションボタンとUI要素を更新"""
+        # 監視フォルダ以外に切り替えたとき、監視中なら自動停止
+        if self._watching and mode != '監視フォルダ':
+            self._stop_watch()
+
         if mode == 'フォルダ参照':
             self._action_btn.configure(text='📂 フォルダを選択')
             self._recursive_chk.configure(state='normal')
@@ -696,13 +700,22 @@ class RenameApp(_BASE):
             except Exception:
                 pass
             self._watch_observer = None
-        self._action_btn.configure(
-            text='👁 監視を開始',
-            fg_color=ctk.ThemeManager.theme['CTkButton']['fg_color'],
-            hover_color=ctk.ThemeManager.theme['CTkButton']['hover_color'],
-        )
-        self._set_status('監視停止', 'gray')
-        self._path_label.configure(text='監視停止', text_color='gray')
+        # アクションボタンの更新は「監視フォルダ」モードのときだけ行う
+        # （他モードへ切り替えた場合は _on_mode_change 側でボタンを更新する）
+        if self._mode_var.get() == '監視フォルダ':
+            try:
+                self._action_btn.configure(
+                    text='👁 監視を開始',
+                    fg_color=ctk.ThemeManager.theme['CTkButton']['fg_color'],
+                    hover_color=ctk.ThemeManager.theme['CTkButton']['hover_color'],
+                )
+            except Exception:
+                pass
+        try:
+            self._set_status('監視停止', 'gray')
+            self._path_label.configure(text='監視停止', text_color='gray')
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # DnD
