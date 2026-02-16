@@ -72,6 +72,97 @@ ST_EXISTS = 'exists'
 CHECK_ON  = '✓'
 CHECK_OFF = '─'
 
+MODES = ['フォルダ参照', 'ファイル選択', 'クラウド', '監視フォルダ']
+
+HELP_TEXT = """\
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+　ファイル自動リネームアプリ  使い方ガイド
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+【基本的な使い方】
+
+  1. 入力方式をモードボタンで選択してください
+  2. アクションボタンを押してファイルを読み込みます
+  3. 候補一覧を確認し、対象ファイルにチェックを入れます
+  4. 「リネーム実行」ボタンを押して完了です
+
+  ※ ファイルやフォルダをアプリにドロップしても読み込めます
+     （tkinterdnd2 インストール時のみ）
+
+──────────────────────────────────────────
+
+【入力モードの説明】
+
+  📂 フォルダ参照
+      フォルダを選択して、その中にあるすべてのファイルを
+      一括で処理します。「サブフォルダ」にチェックを入れると
+      入れ子のフォルダも対象になります。
+
+  📄 ファイル選択
+      複数のファイルを個別に選んで処理します。
+
+  ☁  クラウド
+      Google Drive・Dropbox・OneDrive などのローカル同期
+      フォルダを自動検出して選択できます。
+
+  👁  監視フォルダ
+      指定したフォルダを常時監視します。新しいファイルが
+      追加されると自動的に候補一覧を更新します。
+
+──────────────────────────────────────────
+
+【ファイル名の生成ルール】
+
+  ファイルの内容（メタデータ・テキスト）から
+  タイトル・作成者・日付を取得して命名します。
+
+  例：
+    ・文書タイトル（作成者）2024年1月
+    ・プロジェクト提案書（山田太郎→鈴木部長）2024-03-15
+    ・会議議事録_2024-01-20
+
+  取得できない場合は元のファイル名を元に命名します。
+
+──────────────────────────────────────────
+
+【対応ファイル形式】
+
+  ドキュメント:
+    PDF, Word (.docx/.doc), Excel (.xlsx/.xls),
+    PowerPoint (.pptx/.ppt), EPUB, ODT/ODS/ODP,
+    Pages/Numbers/Keynote
+
+  テキスト:
+    TXT, Markdown, HTML, XML, JSON, YAML,
+    CSV, RTF, LaTeX, ICS, VCF, INI/CFG
+
+  プログラムコード:
+    Python, JavaScript, TypeScript, Java, C/C++,
+    Go, Rust, Ruby, PHP, Swift, Kotlin, その他多数
+
+  メール:
+    EML (.eml), Outlook MSG (.msg)
+
+  画像（EXIFメタデータ):
+    JPEG, PNG, TIFF, HEIC, WebP など
+
+  音声（ID3タグ）:
+    MP3, FLAC, M4A, AAC, OGG, OPUS など
+
+──────────────────────────────────────────
+
+【オプションライブラリ（インストールで機能強化）】
+
+  pip install pypdf       → PDF テキスト抽出精度向上
+  pip install olefile     → 旧 Office 形式 (.doc/.xls) 対応
+  pip install pillow      → 画像 EXIF 取得精度向上
+  pip install mutagen     → 音声タグ取得精度向上
+  pip install watchdog    → 監視フォルダのリアルタイム検知
+  pip install tkinterdnd2 → ドラッグ＆ドロップ対応
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+"""
+
 
 # ---------------------------------------------------------------------------
 # クラウドストレージのローカル同期フォルダを検出
@@ -139,19 +230,20 @@ class RenameApp(_BASE):
         ctk.set_default_color_theme('blue')
 
         self.title('ファイル自動リネーム')
-        self.geometry('1100x640')
-        self.minsize(800, 460)
+        self.geometry('1100x660')
+        self.minsize(800, 500)
 
         self._plans: list[dict] = []
         self._selected_paths: list[str] = []
         self._sort_var   = tk.StringVar(value='ファイル名順')
         self._theme_var  = tk.StringVar(value='システム')
+        self._mode_var   = tk.StringVar(value='フォルダ参照')
         self._sidebar_open = False
 
         # ホットフォルダ監視状態
         self._watching       = False
         self._watch_path:   Path | None = None
-        self._watch_observer = None   # watchdog Observer
+        self._watch_observer = None
         self._watch_seen:   set[Path] = set()
 
         self._build_ui()
@@ -168,42 +260,58 @@ class RenameApp(_BASE):
         top = ctk.CTkFrame(self, fg_color='transparent')
         top.pack(fill='x', padx=12, pady=(10, 4))
 
-        # ① フォルダ参照
-        ctk.CTkButton(top, text='📂 フォルダ', command=self._select_folder,
-                      width=100).pack(side='left', padx=(0, 4))
-        # ② ファイル参照
-        ctk.CTkButton(top, text='📄 ファイル', command=self._select_files,
-                      width=100).pack(side='left', padx=(0, 4))
-        # ③ クラウドストレージ
-        ctk.CTkButton(top, text='☁ クラウド', command=self._select_cloud,
-                      width=100).pack(side='left', padx=(0, 4))
-        # ④ 監視フォルダ（ホットフォルダ）
-        self._watch_btn = ctk.CTkButton(
-            top, text='👁 監視フォルダ', command=self._toggle_watch, width=110)
-        self._watch_btn.pack(side='left', padx=(0, 10))
+        # モード選択セグメントボタン
+        self._mode_seg = ctk.CTkSegmentedButton(
+            top,
+            values=MODES,
+            variable=self._mode_var,
+            command=self._on_mode_change,
+            width=420,
+        )
+        self._mode_seg.pack(side='left', padx=(0, 10))
 
+        # アクションボタン（モードに応じて変化）
+        self._action_btn = ctk.CTkButton(
+            top, text='📂 フォルダを選択',
+            command=self._do_action, width=160,
+        )
+        self._action_btn.pack(side='left', padx=(0, 10))
+
+        # サブフォルダチェック
         self._recursive_var = tk.BooleanVar(value=False)
-        ctk.CTkCheckBox(top, text='サブフォルダ', variable=self._recursive_var,
-                        command=self._on_recursive_toggle).pack(side='left', padx=(0, 10))
+        self._recursive_chk = ctk.CTkCheckBox(
+            top, text='サブフォルダ', variable=self._recursive_var,
+            command=self._on_recursive_toggle,
+        )
+        self._recursive_chk.pack(side='left', padx=(0, 10))
 
+        # 設定ボタン
         ctk.CTkButton(top, text='⚙  設定', command=self._toggle_sidebar,
                       width=80).pack(side='right')
 
-        hint = 'ここにドロップ / またはファイル・フォルダを選択してください' if _DND_AVAILABLE \
-               else 'ファイルまたはフォルダを選択してください'
-        self._path_label = ctk.CTkLabel(top, text=hint, text_color='gray', anchor='w')
+        # ステータスラベル（パス表示）
+        self._path_label = ctk.CTkLabel(
+            top,
+            text='ファイルをドロップ、またはモードを選択して読み込んでください' if _DND_AVAILABLE
+                 else 'モードを選択してファイルを読み込んでください',
+            text_color='gray', anchor='w',
+        )
         self._path_label.pack(side='left', fill='x', expand=True, padx=(0, 10))
 
-        # --- 本体：テーブル + サイドバー ---
+        # --- 本体：コンテンツエリア + サイドバー ---
         body = ctk.CTkFrame(self, fg_color='transparent')
         body.pack(fill='both', expand=True, padx=12, pady=0)
         body.columnconfigure(0, weight=1)
         body.rowconfigure(0, weight=1)
         self._body = body
 
-        # テーブル
+        # ウェルカム／ヘルプパネル（起動時表示）
+        self._welcome_frame = self._make_welcome_panel(body)
+        self._welcome_frame.grid(row=0, column=0, sticky='nsew')
+
+        # テーブルフレーム（ファイル読み込み後に表示）
         table_frame = ctk.CTkFrame(body, fg_color='transparent')
-        table_frame.grid(row=0, column=0, sticky='nsew')
+        self._table_frame = table_frame
 
         cols = (COL_CHECK, COL_OLD, COL_NEW, COL_SOURCE)
         self._tree = ttk.Treeview(table_frame, columns=cols, show='headings',
@@ -234,11 +342,17 @@ class RenameApp(_BASE):
         # 設定サイドバー（初期は非表示）
         self._sidebar = self._make_sidebar()
 
-        # DnD
+        # DnD（常時有効 ─ ウェルカムパネル・テーブル両方に登録）
         if _DND_AVAILABLE:
             for w in (self, self._tree):
                 w.drop_target_register(DND_FILES)
                 w.dnd_bind('<<Drop>>', self._on_drop)
+            # ウェルカムフレーム内ウィジェットにも登録
+            try:
+                self._welcome_frame.drop_target_register(DND_FILES)
+                self._welcome_frame.dnd_bind('<<Drop>>', self._on_drop)
+            except Exception:
+                pass
 
         # --- ボトムバー ---
         bottom = ctk.CTkFrame(self, fg_color='transparent')
@@ -256,9 +370,60 @@ class RenameApp(_BASE):
         )
         self._rename_btn.pack(side='right')
 
-        self._status_label = ctk.CTkLabel(bottom, text='Ready',
+        self._status_label = ctk.CTkLabel(bottom, text='準備完了',
                                            text_color='gray', anchor='w')
         self._status_label.pack(side='left', padx=(16, 0))
+
+    def _make_welcome_panel(self, parent) -> ctk.CTkFrame:
+        """起動時に表示するウェルカム／説明パネル"""
+        frame = ctk.CTkFrame(parent, fg_color='transparent')
+        frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(1, weight=1)
+
+        # DnDゾーン（目立つ枠）
+        if _DND_AVAILABLE:
+            dnd_zone = ctk.CTkFrame(
+                frame, corner_radius=12,
+                border_width=2, border_color='#3a7ebf',
+                fg_color=('gray90', 'gray20'),
+                height=90,
+            )
+            dnd_zone.grid(row=0, column=0, sticky='ew', padx=20, pady=(14, 8))
+            dnd_zone.grid_propagate(False)
+            dnd_label = ctk.CTkLabel(
+                dnd_zone,
+                text='📂  ここにファイルやフォルダをドロップしてください',
+                font=ctk.CTkFont(size=15, weight='bold'),
+                text_color=('gray30', 'gray80'),
+            )
+            dnd_label.place(relx=0.5, rely=0.5, anchor='center')
+            try:
+                dnd_zone.drop_target_register(DND_FILES)
+                dnd_zone.dnd_bind('<<Drop>>', self._on_drop)
+                dnd_label.drop_target_register(DND_FILES)
+                dnd_label.dnd_bind('<<Drop>>', self._on_drop)
+            except Exception:
+                pass
+        else:
+            sep_label = ctk.CTkLabel(
+                frame,
+                text='モードを選択してファイルを読み込んでください',
+                font=ctk.CTkFont(size=14),
+                text_color='gray',
+            )
+            sep_label.grid(row=0, column=0, pady=(14, 8))
+
+        # ヘルプテキスト
+        textbox = ctk.CTkTextbox(
+            frame, wrap='word',
+            font=ctk.CTkFont(family='monospace', size=12),
+            activate_scrollbars=True,
+        )
+        textbox.grid(row=1, column=0, sticky='nsew', padx=20, pady=(0, 8))
+        textbox.insert('end', HELP_TEXT)
+        textbox.configure(state='disabled')
+
+        return frame
 
     def _make_sidebar(self) -> ctk.CTkFrame:
         """設定サイドバー"""
@@ -289,6 +454,47 @@ class RenameApp(_BASE):
         style.theme_use('clam')
         style.configure('App.Treeview',         rowheight=28, font=('', 10))
         style.configure('App.Treeview.Heading', font=('', 9, 'bold'))
+
+    # ------------------------------------------------------------------
+    # モード切り替え
+    # ------------------------------------------------------------------
+
+    def _on_mode_change(self, mode: str):
+        """モードに応じてアクションボタンとUI要素を更新"""
+        if mode == 'フォルダ参照':
+            self._action_btn.configure(text='📂 フォルダを選択')
+            self._recursive_chk.configure(state='normal')
+        elif mode == 'ファイル選択':
+            self._action_btn.configure(text='📄 ファイルを選択')
+            self._recursive_chk.configure(state='disabled')
+        elif mode == 'クラウド':
+            self._action_btn.configure(text='☁  クラウドを選択')
+            self._recursive_chk.configure(state='normal')
+        elif mode == '監視フォルダ':
+            if self._watching:
+                self._action_btn.configure(
+                    text='⏹ 監視を停止',
+                    fg_color='#c0392b', hover_color='#922b21',
+                )
+            else:
+                self._action_btn.configure(
+                    text='👁 監視を開始',
+                    fg_color=ctk.ThemeManager.theme['CTkButton']['fg_color'],
+                    hover_color=ctk.ThemeManager.theme['CTkButton']['hover_color'],
+                )
+            self._recursive_chk.configure(state='disabled')
+
+    def _do_action(self):
+        """現在のモードに応じた処理を実行"""
+        mode = self._mode_var.get()
+        if mode == 'フォルダ参照':
+            self._select_folder()
+        elif mode == 'ファイル選択':
+            self._select_files()
+        elif mode == 'クラウド':
+            self._select_cloud()
+        elif mode == '監視フォルダ':
+            self._toggle_watch()
 
     # ------------------------------------------------------------------
     # サイドバー開閉
@@ -323,7 +529,7 @@ class RenameApp(_BASE):
             pass
 
     # ------------------------------------------------------------------
-    # ① フォルダ参照 / ② ファイル参照
+    # フォルダ参照 / ファイル参照
     # ------------------------------------------------------------------
 
     def _select_folder(self):
@@ -344,7 +550,7 @@ class RenameApp(_BASE):
         self._analyze()
 
     # ------------------------------------------------------------------
-    # ③ クラウドストレージ選択
+    # クラウドストレージ選択
     # ------------------------------------------------------------------
 
     def _select_cloud(self):
@@ -363,7 +569,7 @@ class RenameApp(_BASE):
 
     def _show_cloud_dialog(self, found: dict[str, Path]):
         dlg = ctk.CTkToplevel(self)
-        dlg.title('クラウドストレージ')
+        dlg.title('クラウドストレージを選択')
         dlg.geometry('400x320')
         dlg.resizable(False, False)
         dlg.grab_set()
@@ -414,7 +620,7 @@ class RenameApp(_BASE):
                       hover_color='#1e8449').pack(side='right')
 
     # ------------------------------------------------------------------
-    # ④ ホットフォルダ（監視フォルダ）
+    # ホットフォルダ（監視フォルダ）
     # ------------------------------------------------------------------
 
     def _toggle_watch(self):
@@ -430,12 +636,11 @@ class RenameApp(_BASE):
         self._watch_path = Path(d)
         self._watching   = True
 
-        # 初回分析
         self._selected_paths = [d]
         self._path_label.configure(
             text=f'👁  監視中: {d}', text_color='orange')
-        self._watch_btn.configure(
-            text='⏹ 監視停止',
+        self._action_btn.configure(
+            text='⏹ 監視を停止',
             fg_color='#c0392b', hover_color='#922b21')
         self._analyze()
 
@@ -491,14 +696,13 @@ class RenameApp(_BASE):
             except Exception:
                 pass
             self._watch_observer = None
-        self._watch_btn.configure(
-            text='👁 監視フォルダ',
+        self._action_btn.configure(
+            text='👁 監視を開始',
             fg_color=ctk.ThemeManager.theme['CTkButton']['fg_color'],
             hover_color=ctk.ThemeManager.theme['CTkButton']['hover_color'],
         )
         self._set_status('監視停止', 'gray')
-        self._path_label.configure(
-            text='監視停止', text_color='gray')
+        self._path_label.configure(text='監視停止', text_color='gray')
 
     # ------------------------------------------------------------------
     # DnD
@@ -526,6 +730,20 @@ class RenameApp(_BASE):
         return 'white' if ctk.get_appearance_mode() == 'Dark' else 'black'
 
     # ------------------------------------------------------------------
+    # コンテンツエリアの切り替え（ウェルカム ↔ テーブル）
+    # ------------------------------------------------------------------
+
+    def _show_table(self):
+        """テーブルを表示し、ウェルカムパネルを隠す"""
+        self._welcome_frame.grid_remove()
+        self._table_frame.grid(row=0, column=0, sticky='nsew')
+
+    def _show_welcome(self):
+        """ウェルカムパネルを表示し、テーブルを隠す"""
+        self._table_frame.grid_remove()
+        self._welcome_frame.grid(row=0, column=0, sticky='nsew')
+
+    # ------------------------------------------------------------------
     # 分析（バックグラウンドスレッド）
     # ------------------------------------------------------------------
 
@@ -541,6 +759,7 @@ class RenameApp(_BASE):
             return
         self._set_status('分析中...', 'dodgerblue')
         self._rename_btn.configure(state='disabled')
+        self._show_table()
         self._tree.delete(*self._tree.get_children())
         self._plans.clear()
 
@@ -573,6 +792,10 @@ class RenameApp(_BASE):
 
     def _populate(self, plans: list[dict]):
         self._plans = plans
+        if not plans:
+            self._show_welcome()
+            self._set_status('対象ファイルが見つかりませんでした', 'gray')
+            return
         for p in plans:
             check = CHECK_ON if p['selected'] else CHECK_OFF
             if p['status'] == ST_SAME:
