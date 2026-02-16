@@ -1013,19 +1013,41 @@ SIZE_LIMIT_TEXT   = 50  * 1024 * 1024   # 50 MB
 SIZE_LIMIT_BINARY = 200 * 1024 * 1024   # 200 MB
 
 
-def build_display_name(title: str, author: str | None, created: str | None) -> str:
-    """'文書名（作成者）作成日付' の形式でファイル名を組み立てる"""
-    name = title
-    if author:
-        name += f'（{author}）'
-    if created:
-        name += created
-    return name
+# タイトル構成要素の選択肢と既定順序
+TITLE_ORDER_PARTS = ('題名', '作成者', '日付')
+DEFAULT_TITLE_ORDER: list[str] = ['題名', '作成者', '日付']
 
 
-def generate_title(path: Path) -> tuple[str, str]:
+def build_display_name(
+    title: str,
+    author: str | None,
+    created: str | None,
+    order: list[str] | None = None,
+) -> str:
+    """指定した順序でファイル名を組み立てる（デフォルト: 題名・作成者・日付）"""
+    if order is None:
+        order = DEFAULT_TITLE_ORDER
+    segments: list[str] = []
+    for part in order:
+        if part == '題名':
+            segments.append(title)
+        elif part == '作成者' and author:
+            segments.append(f'（{author}）')
+        elif part == '日付' and created:
+            segments.append(created)
+    # 安全策: 題名が順序に含まれていない場合は先頭に追加
+    if '題名' not in order:
+        segments.insert(0, title)
+    return ''.join(segments)
+
+
+def generate_title(
+    path: Path,
+    order: list[str] | None = None,
+) -> tuple[str, str]:
     """
     ファイルのタイトルを生成する。
+    order: タイトル構成要素の表示順序（'題名'/'作成者'/'日付' の組み合わせ）
     戻り値: (display_name, source)  source は 'content' または 'filename'
     """
     ext = path.suffix.lstrip('.').lower()
@@ -1136,17 +1158,12 @@ def generate_title(path: Path) -> tuple[str, str]:
         raw_title = clean_filename(base)
         source = 'filename'
 
-    # PDF の場合のみ宛先を表示名に含める: 文書名（作成者→宛先）作成日付
-    if recipient and author:
-        name = raw_title + f'（{author}→{recipient}）'
-    elif recipient:
-        name = raw_title + f'（→{recipient}）'
+    # PDF の場合のみ宛先を含める: 作成者フィールドを「作成者→宛先」に置き換えて順序適用
+    if recipient:
+        author_display = f'{author}→{recipient}' if author else f'→{recipient}'
+        name = build_display_name(raw_title, author_display, created, order)
     else:
-        name = build_display_name(raw_title, author, created)
-        return name, source
-
-    if created:
-        name += created
+        name = build_display_name(raw_title, author, created, order)
     return name, source
 
 

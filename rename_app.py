@@ -26,7 +26,10 @@ from tkinter import filedialog, messagebox, ttk
 
 import customtkinter as ctk
 
-from rename_files import collect_files, generate_title, sanitize_filename
+from rename_files import (
+    collect_files, generate_title, sanitize_filename,
+    TITLE_ORDER_PARTS, DEFAULT_TITLE_ORDER,
+)
 
 # ドラッグ＆ドロップ（オプション）
 try:
@@ -239,6 +242,12 @@ class RenameApp(_BASE):
         self._theme_var  = tk.StringVar(value='システム')
         self._mode_var   = tk.StringVar(value='フォルダ参照')
         self._sidebar_open = False
+        # タイトル構成要素の順序（デフォルト: 題名・作成者・日付）
+        self._order_vars: list[tk.StringVar] = [
+            tk.StringVar(value=DEFAULT_TITLE_ORDER[0]),  # 1番目
+            tk.StringVar(value=DEFAULT_TITLE_ORDER[1]),  # 2番目
+            tk.StringVar(value=DEFAULT_TITLE_ORDER[2]),  # 3番目
+        ]
 
         # ホットフォルダ監視状態
         self._watching       = False
@@ -445,7 +454,22 @@ class RenameApp(_BASE):
             sb, values=['ライト', 'ダーク', 'システム'],
             variable=self._theme_var, command=self._on_theme_change,
             width=166,
-        ).pack(padx=12, pady=(0, 16))
+        ).pack(padx=12, pady=(0, 12))
+
+        # ファイル名の構成順序
+        ctk.CTkLabel(sb, text='ファイル名の順序', anchor='w').pack(
+            fill='x', padx=12, pady=(4, 4))
+        order_opts = list(TITLE_ORDER_PARTS) + ['（省略）']
+        labels = ['1番目', '2番目', '3番目']
+        for lbl, var in zip(labels, self._order_vars):
+            row = ctk.CTkFrame(sb, fg_color='transparent')
+            row.pack(fill='x', padx=12, pady=(0, 4))
+            ctk.CTkLabel(row, text=lbl, width=46, anchor='w').pack(side='left')
+            ctk.CTkOptionMenu(
+                row, values=order_opts, variable=var,
+                command=lambda _: self._on_order_change(),
+                width=114,
+            ).pack(side='left')
 
         return sb
 
@@ -518,6 +542,15 @@ class RenameApp(_BASE):
     def _on_sort_change(self, _=None):
         if self._plans:
             self._re_sort_and_repopulate()
+
+    def _on_order_change(self, _=None):
+        """タイトル順序が変更されたとき → ファイルが読み込まれていれば再分析"""
+        if self._selected_paths:
+            self._analyze()
+
+    def _get_title_order(self) -> list[str]:
+        """順序設定から '（省略）' を除いたリストを返す"""
+        return [v.get() for v in self._order_vars if v.get() != '（省略）']
 
     def _on_theme_change(self, value: str):
         mapping = {'ライト': 'light', 'ダーク': 'dark', 'システム': 'system'}
@@ -778,12 +811,13 @@ class RenameApp(_BASE):
 
         paths     = self._selected_paths[:]
         recursive = self._recursive_var.get()
+        order     = self._get_title_order()
 
         def worker():
             files = self._sorted_files(collect_files(paths, recursive))
             plans = []
             for f in files:
-                title, source = generate_title(f)
+                title, source = generate_title(f, order)
                 new_name = sanitize_filename(title) + f.suffix
                 new_path = f.parent / new_name
                 if f.name == new_name:
